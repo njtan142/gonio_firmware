@@ -20,8 +20,10 @@
 void i2c_master_init(void);
 void ssd1306_init(void);
 void ssd1306_display_clear(void);
+void ssd1306_clear_buffer(void);
 void ssd1306_draw_pixel(int x, int y, int color);
 void ssd1306_display_text(int page, int col, char *text);
+void ssd1306_set_text(int page, int col, char *text);
 void ssd1306_update_display(void);
 
 #endif

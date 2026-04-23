@@ -68,8 +68,12 @@ void ssd1306_init(void) {
     ssd1306_update_display();
 }
 
-void ssd1306_display_clear(void) {
+void ssd1306_clear_buffer(void) {
     memset(buffer, 0, sizeof(buffer));
+}
+
+void ssd1306_display_clear(void) {
+    ssd1306_clear_buffer();
     ssd1306_update_display();
 }
 
@@ -98,8 +102,7 @@ void ssd1306_draw_char(int x, int y, char c) {
     }
 }
 
-void ssd1306_display_text(int page, int col, char *text) {
-    // Basic text drawing. page = y/8, col = x
+void ssd1306_set_text(int page, int col, char *text) {
     int x = col;
     int y = page * 8;
     while (*text) {
@@ -111,6 +114,10 @@ void ssd1306_display_text(int page, int col, char *text) {
         }
         text++;
     }
+}
+
+void ssd1306_display_text(int page, int col, char *text) {
+    ssd1306_set_text(page, col, text);
     ssd1306_update_display();
 }
 

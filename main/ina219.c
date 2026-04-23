@@ -11,8 +11,9 @@
 #define INA219_REG_CURRENT  0x04
 #define INA219_REG_CALIB    0x05
 
-// current_lsb = 1mA, shunt = 0.1 ohm → cal = 4096
-#define INA219_CALIB_VALUE  4096
+// current_lsb = 1mA, shunt = 0.1 ohm → cal = trunc(0.04096 / (0.001 * 0.1)) = 409
+// If your board has a 0.01 ohm shunt, use 4096 instead
+#define INA219_CALIB_VALUE  409
 #define CURRENT_LSB_MA      1.0f
 #define POWER_LSB_MW        20.0f
 
@@ -64,7 +65,7 @@ float ina219_read_bus_voltage(void) {
 float ina219_read_current(void) {
     uint16_t raw = 0;
     ina219_read_reg(INA219_REG_CURRENT, &raw);
-    return (int16_t)raw * CURRENT_LSB_MA;
+    return -(int16_t)raw * CURRENT_LSB_MA;
 }
 
 float ina219_read_power(void) {

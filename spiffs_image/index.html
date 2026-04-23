@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ESP32 Monitor</title>
+  <style>
+    body { font-family: monospace; background: #111; color: #0f0; padding: 2rem; }
+    h1 { color: #0f0; }
+    p { color: #888; }
+  </style>
+</head>
+<body>
+  <h1>ESP32 Monitor</h1>
+  <p>Replace this file with your web app. Drop files into <code>spiffs_image/</code>, build, then flash:</p>
+  <pre>esptool.py --chip esp32c3 --port &lt;PORT&gt; --spi-connection 4,5,6,7 write_flash 0x0 build/spiffs_ext.bin</pre>
+</body>
+</html>
