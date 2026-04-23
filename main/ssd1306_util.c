@@ -22,7 +22,7 @@ static void ssd1306_command(uint8_t command) {
 }
 
 
-void ssd1306_init(void) {
+void i2c_master_init(void) {
     i2c_config_t conf = {
         .mode = I2C_MODE_MASTER,
         .sda_io_num = I2C_MASTER_SDA_IO,
@@ -31,10 +31,11 @@ void ssd1306_init(void) {
         .scl_pullup_en = GPIO_PULLUP_ENABLE,
         .master.clk_speed = I2C_MASTER_FREQ_HZ,
     };
-
     i2c_param_config(I2C_MASTER_NUM, &conf);
     i2c_driver_install(I2C_MASTER_NUM, conf.mode, I2C_MASTER_RX_BUF_DISABLE, I2C_MASTER_TX_BUF_DISABLE, 0);
+}
 
+void ssd1306_init(void) {
     // Initialization Sequence
     ssd1306_command(0xAE); // Display OFF
     ssd1306_command(0xD5); // Set Display Clock Divide Ratio
