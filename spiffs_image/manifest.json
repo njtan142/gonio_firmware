@@ -1,0 +1,65 @@
+{
+  "timestamp": "2026-04-23T19:19:10.311Z",
+  "totalFiles": 8,
+  "originalSize": 3403074,
+  "compressedSize": 1206857,
+  "compressionRatio": "64.5%",
+  "files": [
+    {
+      "path": "/a/index.css",
+      "mimeType": "text/css",
+      "originalSize": 1631,
+      "compressedSize": 726,
+      "gzipped": true
+    },
+    {
+      "path": "/a/scene.bin",
+      "mimeType": "application/octet-stream",
+      "originalSize": 2653128,
+      "compressedSize": 1016599,
+      "gzipped": true
+    },
+    {
+      "path": "/a/scene.gltf",
+      "mimeType": "application/octet-stream",
+      "originalSize": 35505,
+      "compressedSize": 5896,
+      "gzipped": true
+    },
+    {
+      "path": "/c/BJvM6tO2.js",
+      "mimeType": "text/javascript",
+      "originalSize": 8810,
+      "compressedSize": 4029,
+      "gzipped": true
+    },
+    {
+      "path": "/c/BXnnfgdS.js",
+      "mimeType": "text/javascript",
+      "originalSize": 777,
+      "compressedSize": 440,
+      "gzipped": true
+    },
+    {
+      "path": "/DomFmr6W.js",
+      "mimeType": "text/javascript",
+      "originalSize": 670976,
+      "compressedSize": 173828,
+      "gzipped": true
+    },
+    {
+      "path": "/index.html",
+      "mimeType": "text/html",
+      "originalSize": 30731,
+      "compressedSize": 4608,
+      "gzipped": true
+    },
+    {
+      "path": "/vite.svg",
+      "mimeType": "image/svg+xml",
+      "originalSize": 1516,
+      "compressedSize": 731,
+      "gzipped": true
+    }
+  ]
+}
