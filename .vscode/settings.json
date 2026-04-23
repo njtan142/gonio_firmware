@@ -8,6 +8,11 @@
   ],
   "idf.currentSetup": "C:\\Users\\njtan\\esp\\v5.5.2\\esp-idf",
   "idf.customExtraVars": {
-    "IDF_TARGET": "esp32c3"
-  }
+    "IDF_TARGET": "esp32c3",
+    "OPENOCD_USB_ADAPTER_LOCATION": "2-7"
+  },
+  "idf.openOcdConfigs": [
+    "board/esp32c3-builtin.cfg"
+  ],
+  "idf.portWin": "COM5"
 }
