@@ -1,0 +1,131 @@
+#include <string.h>
+#include "ssd1306_util.h"
+#include "font8x8_basic.h"
+
+static uint8_t buffer[SSD1306_WIDTH * SSD1306_HEIGHT / 8];
+
+static esp_err_t ssd1306_write_byte(uint8_t reg, uint8_t data) {
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (SSD1306_I2C_ADDRESS << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, reg, true);
+    i2c_master_write_byte(cmd, data, true);
+    i2c_master_stop(cmd);
+    esp_err_t ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(1000));
+    i2c_cmd_link_delete(cmd);
+    return ret;
+}
+
+// Write command
+static void ssd1306_command(uint8_t command) {
+    ssd1306_write_byte(0x00, command);
+}
+
+
+void ssd1306_init(void) {
+    i2c_config_t conf = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = I2C_MASTER_SDA_IO,
+        .scl_io_num = I2C_MASTER_SCL_IO,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = I2C_MASTER_FREQ_HZ,
+    };
+
+    i2c_param_config(I2C_MASTER_NUM, &conf);
+    i2c_driver_install(I2C_MASTER_NUM, conf.mode, I2C_MASTER_RX_BUF_DISABLE, I2C_MASTER_TX_BUF_DISABLE, 0);
+
+    // Initialization Sequence
+    ssd1306_command(0xAE); // Display OFF
+    ssd1306_command(0xD5); // Set Display Clock Divide Ratio
+    ssd1306_command(0x80); // Suggested ratio
+    ssd1306_command(0xA8); // Set Multiplex Ratio
+    ssd1306_command(0x1F); // 1/32 Duty
+    ssd1306_command(0xD3); // Set Display Offset
+    ssd1306_command(0x00); // 0
+    ssd1306_command(0x40); // Set Start Line 0
+    ssd1306_command(0x8D); // Charge Pump
+    ssd1306_command(0x14); // Enable Charge Pump
+    ssd1306_command(0x20); // Memory Addressing Mode
+    ssd1306_command(0x00); // Horizontal connection
+    ssd1306_command(0xA1); // Segment Remap 0 to 127
+    ssd1306_command(0xC8); // COM Output Scan Direction
+    ssd1306_command(0xDA); // Set COM Pins Hardware Config
+    ssd1306_command(0x02); // 
+    ssd1306_command(0x81); // Set Contrast
+    ssd1306_command(0x8F);
+    ssd1306_command(0xD9); // Set Pre-charge Period
+    ssd1306_command(0xF1);
+    ssd1306_command(0xDB); // Set VCOMH Deselect Level
+    ssd1306_command(0x40);
+    ssd1306_command(0xA4); // Entire Display Resume
+    ssd1306_command(0xA6); // Normal Display
+    ssd1306_command(0xAF); // Display ON
+    
+    // Clear Buffer
+    memset(buffer, 0, sizeof(buffer));
+    ssd1306_update_display();
+}
+
+void ssd1306_display_clear(void) {
+    memset(buffer, 0, sizeof(buffer));
+    ssd1306_update_display();
+}
+
+void ssd1306_draw_pixel(int x, int y, int color) {
+    if (x >= SSD1306_WIDTH || y >= SSD1306_HEIGHT) return;
+    if (color) {
+        buffer[x + (y / 8) * SSD1306_WIDTH] |= (1 << (y % 8));
+    } else {
+        buffer[x + (y / 8) * SSD1306_WIDTH] &= ~(1 << (y % 8));
+    }
+}
+
+void ssd1306_draw_char(int x, int y, char c) {
+    if (x > SSD1306_WIDTH - 8 || y > SSD1306_HEIGHT - 8) return;
+    
+    // Check range
+    // if (c < 0 || c > 127) c = '?'; // Removing this check as char might be unsigned or signed depending on compiler
+
+    for (int i = 0; i < 8; i++) {
+        uint8_t line = font8x8_basic[(uint8_t)c][i];
+        for (int j = 0; j < 8; j++) {
+            if (line & (1 << j)) {
+                ssd1306_draw_pixel(x + i, y + j, 1);
+            }
+        }
+    }
+}
+
+void ssd1306_display_text(int page, int col, char *text) {
+    // Basic text drawing. page = y/8, col = x
+    int x = col;
+    int y = page * 8;
+    while (*text) {
+        ssd1306_draw_char(x, y, *text);
+        x += 8;
+        if (x >= SSD1306_WIDTH) {
+            x = 0;
+            y += 8;
+        }
+        text++;
+    }
+    ssd1306_update_display();
+}
+
+void ssd1306_update_display(void) {
+    for (uint8_t i = 0; i < SSD1306_HEIGHT / 8; i++) {
+        ssd1306_command(0xB0 + i); // Set Page Start Address
+        ssd1306_command(0x00);     // Set Lower Column Start Address
+        ssd1306_command(0x10);     // Set Higher Column Start Address
+
+        i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+        i2c_master_start(cmd);
+        i2c_master_write_byte(cmd, (SSD1306_I2C_ADDRESS << 1) | I2C_MASTER_WRITE, true);
+        i2c_master_write_byte(cmd, 0x40, true); // Data mode
+        i2c_master_write(cmd, &buffer[SSD1306_WIDTH * i], SSD1306_WIDTH, true);
+        i2c_master_stop(cmd);
+        i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(1000));
+        i2c_cmd_link_delete(cmd);
+    }
+}
