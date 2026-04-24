@@ -2,6 +2,9 @@
 
 #include "app_config.h"
 #include "app_runtime.h"
+#if !ENABLE_SYSTEM_LOG
+#define LOG_LOCAL_LEVEL ESP_LOG_NONE
+#endif
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -17,7 +20,14 @@ extern float soc_percent;
 extern SemaphoreHandle_t counter_mutex;
 extern SemaphoreHandle_t i2c_mutex;
 
-// LiPo OCV -> SoC lookup with linear interpolation
+/**
+ * @brief Converts LiPo open-circuit voltage to State of Charge (SoC).
+ *
+ * Uses a lookup table with linear interpolation.
+ *
+ * @param v Voltage reading.
+ * @return float State of Charge percentage (0.0 to 100.0).
+ */
 float lipo_soc_from_voltage(float v) {
   static const float v_table[] = {3.00f, 3.40f, 3.50f, 3.60f, 3.70f,
                                   3.80f, 3.90f, 4.00f, 4.10f, 4.20f};
@@ -28,29 +38,45 @@ float lipo_soc_from_voltage(float v) {
     return 0.0f;
   if (v >= v_table[n - 1])
     return 100.0f;
+  // Iterate through the voltage breakpoints to find the correct interpolation segment.
   for (int i = 1; i < n; i++) {
     if (v <= v_table[i]) {
+      // Calculate 't', the normalized position (0.0 to 1.0) of the voltage between the lower and upper bounds.
       float t = (v - v_table[i - 1]) / (v_table[i] - v_table[i - 1]);
+      // Interpolate the SoC using 't' to smoothly transition between the table's fixed percentage points.
       return s_table[i - 1] + t * (s_table[i] - s_table[i - 1]);
     }
   }
   return 100.0f;
 }
 
-// Runs every 10ms - integrates current over time (trapezoidal accumulation)
+/**
+ * @brief FreeRTOS task for Coulomb counting.
+ *
+ * Runs every 10ms. Integrates current over time (trapezoidal accumulation).
+ *
+ * @param pv Task parameter (unused).
+ */
 void coulomb_task(void *pv) {
   int64_t last_ts = 0;
 
   while (1) {
     int64_t now = esp_timer_get_time(); // microseconds
 
+    // Acquire the shared I2C bus lock to safely query the INA219.
+    // This prevents collisions if the UI task tries to update the OLED at the same time.
     xSemaphoreTake(i2c_mutex, portMAX_DELAY);
-    float current = ina219_read_current(); // mA
+    float current = ina219_read_current(); // Measured in milliamperes (mA)
     xSemaphoreGive(i2c_mutex);
 
-    // Skip integration on the very first sample because dt is unknown.
+    // Skip integration on the very first sample because we don't have a valid previous timestamp (dt is unknown).
     if (last_ts != 0) {
-      double dt = (double)(now - last_ts) / 1000000.0; // seconds
+      // Calculate delta time (dt) in seconds. esp_timer_get_time() returns microseconds.
+      double dt = (double)(now - last_ts) / 1000000.0;
+      
+      // Accumulate the consumed charge into the global tracker.
+      // This is a basic Riemann sum integration (Current * Time = Charge in mA*s).
+      // We lock counter_mutex so the UI task doesn't read a partially updated value during this math.
       xSemaphoreTake(counter_mutex, portMAX_DELAY);
       total_amp_seconds += current * dt;
       xSemaphoreGive(counter_mutex);
@@ -61,7 +87,14 @@ void coulomb_task(void *pv) {
   }
 }
 
-// Runs every 1s - computes mAh consumed in the last second and updates display
+/**
+ * @brief FreeRTOS task for UI and telemetry updates.
+ *
+ * Runs every 1s. Computes mAh consumed in the last second and updates the OLED display
+ * and WebRTC telemetry.
+ *
+ * @param pv Task parameter (unused).
+ */
 void ui_task(void *pv) {
   double prev_total = 0.0;
   char line[32];
@@ -69,17 +102,22 @@ void ui_task(void *pv) {
   while (1) {
     vTaskDelay(pdMS_TO_TICKS(1000));
 
-    // Snapshot under lock so the OLED/HTTP path never races with the sampler.
+    // Snapshot the accumulator under lock so the UI and HTTP systems never
+    // read a tearing/corrupted value while the 100Hz sampler task is writing to it.
     xSemaphoreTake(counter_mutex, portMAX_DELAY);
     double snapshot = total_amp_seconds;
     xSemaphoreGive(counter_mutex);
 
+    // Calculate how much charge (in mA*s) was consumed since the last 1-second UI tick.
     double delta_mas = snapshot - prev_total;
-    // Convert mA*s to mAh for human-readable telemetry.
+    
+    // Convert mA*s (milliamp-seconds) to mAh (milliamp-hours) for standard, human-readable telemetry.
+    // 3600 seconds = 1 hour.
     double mah_per_sec = delta_mas / 3600.0;
     prev_total = snapshot;
 
-    // Coulomb counting: subtract consumed charge from remaining battery.
+    // Active Coulomb counting: subtract the strictly consumed charge from the remaining battery capacity.
+    // BATTERY_CAPACITY_MAS represents the total expected battery capacity scaled to milliamp-seconds.
     soc_percent -= (float)(delta_mas / BATTERY_CAPACITY_MAS * 100.0);
     if (soc_percent < 0.0f)
       soc_percent = 0.0f;

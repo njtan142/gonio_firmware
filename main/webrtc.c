@@ -1,6 +1,10 @@
 #include "webrtc.h"
 #include "peer.h"
 #include "peer_connection.h"
+#include "app_config.h"
+#if !ENABLE_WEBRTC_LOG
+#define LOG_LOCAL_LEVEL ESP_LOG_NONE
+#endif
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -32,13 +36,26 @@ static uint32_t           g_tx_packets    = 0;
 static uint32_t           g_tx_bytes      = 0;
 static uint32_t           g_rx_messages   = 0;
 
-/* Mock sine-wave parameters matching JS app's ACTIVE_JOINTS order:
- * [0] left-elbow  [1] right-elbow  [2] left-knee  [3] right-knee */
+/**
+ * Mock sine-wave parameters matching JS app's ACTIVE_JOINTS order:
+ * [0] left-elbow  [1] right-elbow  [2] left-knee  [3] right-knee
+ */
 static const float MOCK_CENTER[]    = { 80.0f,  75.0f,  90.0f,  85.0f };
 static const float MOCK_AMP[]       = { 40.0f,  38.0f,  45.0f,  42.0f };
 static const float MOCK_PERIOD_MS[] = { 8000.0f, 7500.0f, 10000.0f, 9500.0f };
 static const float MOCK_PHASE[]     = { 0.0f, 1.2f, 0.5f, 1.8f };
 
+/**
+ * @brief Generates mock kinematic joint angles using a phase-shifted sine wave.
+ *
+ * Since physical encoders are not connected in this firmware iteration, we simulate 
+ * joint angles to test the high-frequency WebRTC telemetry link and the browser's 3D visualizer.
+ * Each "joint" runs on a slightly different period and phase to create organic-looking motion.
+ *
+ * @param s Sensor index (0=left-elbow, 1=right-elbow, 2=left-knee, 3=right-knee).
+ * @param t_ms Current system uptime in milliseconds, used as the time domain 'x' input.
+ * @return float Mock angle strictly clamped between 0.0 and 180.0 degrees to match physical servo limits.
+ */
 static float mock_degrees(int s, int64_t t_ms) {
     float deg = MOCK_CENTER[s] + MOCK_AMP[s] *
                 sinf(2.0f * (float)M_PI * (float)t_ms / MOCK_PERIOD_MS[s] + MOCK_PHASE[s]);
@@ -48,8 +65,24 @@ static float mock_degrees(int s, int64_t t_ms) {
     return deg;
 }
 
-/* Pack one 8-byte sensor frame, big-endian.
- * Layout: [63:50]=14-bit angle  [49:18]=32-bit µs ts  [17:10]=8-bit SoC  [9:0]=flags */
+/**
+ * @brief Packs a single kinematic sensor reading into a highly optimized 8-byte payload.
+ *
+ * To maximize telemetry throughput over the WebRTC Data Channel, we avoid heavy JSON payloads.
+ * Instead, we use a custom 64-bit binary struct, packed tightly:
+ *
+ * [Bits 63:50] - 14-bit Angle (0-360 degrees mapped linearly to 0-16383).
+ * [Bits 49:18] - 32-bit Timestamp (microseconds since boot, allows for precise browser-side jitter buffering).
+ * [Bits 17:10] - 8-bit State of Charge (SoC % mapped to 0-255).
+ * [Bits 9:0]   - 10-bit Flags (Reserved for future fault codes or calibration markers).
+ *
+ * The final 64-bit block is serialized in strict Network Byte Order (Big-Endian) so the browser's 
+ * JavaScript DataView can parse it natively without endian-swapping overhead.
+ *
+ * @param[out] buf Pointer to an 8-byte buffer where the serialized data will be written.
+ * @param s The joint index being sampled.
+ * @param t_us The exact hardware microsecond timestamp of the sample.
+ */
 static void pack_frame(uint8_t *buf, int s, int64_t t_us) {
     float    deg   = mock_degrees(s, t_us / 1000);
     // 14-bit angle field maps 0..360 deg onto 0..16383 raw units.
@@ -67,6 +100,11 @@ static void pack_frame(uint8_t *buf, int s, int64_t t_us) {
     }
 }
 
+/**
+ * @brief Creates a default PeerConfiguration.
+ *
+ * @return PeerConfiguration WebRTC configuration struct.
+ */
 static PeerConfiguration make_config(void) {
     PeerConfiguration cfg = {
         /* No STUN/TURN — local AP, host candidates are sufficient */
@@ -80,6 +118,12 @@ static PeerConfiguration make_config(void) {
 
 /* ── libpeer callbacks ──────────────────────────────────────────────────── */
 
+/**
+ * @brief Callback for ICE connection state changes.
+ *
+ * @param state New ICE connection state.
+ * @param userdata User data pointer.
+ */
 static void on_icestate(PeerConnectionState state, void *userdata) {
     ESP_LOGI(TAG, "ICE state: %s", peer_connection_state_to_string(state));
     // Any terminal/failed ICE state should stop telemetry transmission.
@@ -90,8 +134,14 @@ static void on_icestate(PeerConnectionState state, void *userdata) {
     }
 }
 
-/* Called from peer_connection_loop() (within peer_main_task) once the local
-   description (answer SDP + host ICE candidates) is ready. */
+/**
+ * @brief Callback triggered when the local description is ready.
+ *
+ * Called from `peer_connection_loop()` once the local answer SDP + host ICE candidates are ready.
+ *
+ * @param sdp The generated local SDP string.
+ * @param userdata User data pointer.
+ */
 static void on_local_description(char *sdp, void *userdata) {
     // Replace stale cached SDP, then wake waiter in webrtc_handle_offer().
     free(g_answer_sdp);
@@ -102,6 +152,11 @@ static void on_local_description(char *sdp, void *userdata) {
     xSemaphoreGive(g_answer_ready);
 }
 
+/**
+ * @brief Callback triggered when the data channel opens.
+ *
+ * @param userdata User data pointer.
+ */
 static void on_dc_open(void *userdata) {
   ESP_LOGI(TAG, "data channel open");
   // Reset counters when a new browser session connects.
@@ -112,11 +167,24 @@ static void on_dc_open(void *userdata) {
     g_rx_messages   = 0;
 }
 
+/**
+ * @brief Callback triggered when the data channel closes.
+ *
+ * @param userdata User data pointer.
+ */
 static void on_dc_close(void *userdata) {
     ESP_LOGI(TAG, "data channel closed");
     g_dc_open = false;
 }
 
+/**
+ * @brief Callback triggered when a message is received on the data channel.
+ *
+ * @param msg The message payload.
+ * @param len Length of the message payload.
+ * @param userdata User data pointer.
+ * @param sid Stream ID of the data channel.
+ */
 static void on_dc_message(char *msg, size_t len, void *userdata, uint16_t sid) {
     g_rx_messages++;
     // Current firmware does not parse inbound payloads; we only count/log them.
@@ -129,6 +197,11 @@ static void on_dc_message(char *msg, size_t len, void *userdata, uint16_t sid) {
 
 /* ── FreeRTOS tasks ─────────────────────────────────────────────────────── */
 
+/**
+ * @brief FreeRTOS task that periodically drives the libpeer state machine.
+ *
+ * @param pv Task parameter (unused).
+ */
 static void peer_main_task(void *pv) {
   while (1) {
     // libpeer requires regular polling to drive ICE and callback dispatch.
@@ -139,6 +212,11 @@ static void peer_main_task(void *pv) {
     }
 }
 
+/**
+ * @brief FreeRTOS task that streams telemetry data over the WebRTC data channel.
+ *
+ * @param pv Task parameter (unused).
+ */
 static void streaming_task(void *pv) {
     uint8_t payload[32];
     int64_t last_stat_log_us = 0;
@@ -181,6 +259,9 @@ static void streaming_task(void *pv) {
 
 /* ── helpers ────────────────────────────────────────────────────────────── */
 
+/**
+ * @brief Registers WebRTC callbacks with the active PeerConnection.
+ */
 static void setup_callbacks(void) {
     // Register all callbacks immediately after creating a new PeerConnection.
     peer_connection_oniceconnectionstatechange(g_pc, on_icestate);
@@ -190,6 +271,11 @@ static void setup_callbacks(void) {
 
 /* ── Public API ─────────────────────────────────────────────────────────── */
 
+/**
+ * @brief Initializes the WebRTC subsystem.
+ *
+ * @return ESP_OK on success.
+ */
 esp_err_t webrtc_init(void) {
   peer_init();
 
@@ -206,6 +292,23 @@ esp_err_t webrtc_init(void) {
     return ESP_OK;
 }
 
+/**
+ * @brief Core WebRTC signaling state machine: Processes a browser's SDP Offer and generates an Answer.
+ *
+ * This is the heaviest function in the system. When a browser calls `/api/offer`, this routine must:
+ * 1. Acquire `g_offer_lock` to ensure we never process two concurrent signaling requests 
+ *    (e.g., if the user mashes the connect button).
+ * 2. Tear down any existing PeerConnection. This cleanly handles "browser refresh" scenarios 
+ *    where the previous connection died silently.
+ * 3. Initialize a fresh `libpeer` PeerConnection and inject the browser's remote SDP.
+ * 4. Block on `g_answer_ready` while the background `peer_main_task` parses the remote SDP, 
+ *    gathers local ICE host candidates (from our SoftAP IP), and formulates the local Answer.
+ * 5. Extract the generated Answer SDP and hand it back to the HTTP handler to return to the browser.
+ *
+ * @param offer_sdp The raw SDP string received from the browser's HTTP POST body.
+ * @param[out] answer_out Pointer that will be updated to point to a dynamically allocated SDP answer string.
+ * @return ESP_OK on success, ESP_ERR_TIMEOUT if ICE gathering stalls, or ESP_FAIL on internal errors.
+ */
 esp_err_t webrtc_handle_offer(const char *offer_sdp, char **answer_out) {
   // Prevent concurrent renegotiations from overlapping shared global state.
   if (xSemaphoreTake(g_offer_lock, pdMS_TO_TICKS(100)) != pdTRUE)
@@ -261,11 +364,22 @@ esp_err_t webrtc_handle_offer(const char *offer_sdp, char **answer_out) {
     return ESP_OK;
 }
 
+/**
+ * @brief Frees the generated answer SDP string.
+ *
+ * @param answer The SDP answer string to free.
+ */
 void webrtc_free_answer(char *answer) {
   // Ownership is transferred to caller by webrtc_handle_offer().
   free(answer);
 }
 
+/**
+ * @brief Adds a trickled ICE candidate to the WebRTC connection.
+ *
+ * @param candidate The ICE candidate string.
+ * @return ESP_OK on success, ESP_FAIL or ESP_ERR_INVALID_STATE on error.
+ */
 esp_err_t webrtc_add_ice_candidate(const char *candidate) {
     if (!g_pc) return ESP_ERR_INVALID_STATE;
     // Add candidate under lock because g_pc can be replaced during renegotiation.
@@ -282,15 +396,30 @@ esp_err_t webrtc_add_ice_candidate(const char *candidate) {
     return ESP_OK;
 }
 
+/**
+ * @brief Checks if the WebRTC data channel is currently open.
+ *
+ * @return true if connected, false otherwise.
+ */
 bool webrtc_is_connected(void) {
     return g_dc_open;
 }
 
+/**
+ * @brief Sets the State of Charge (SoC) value for telemetry transmission.
+ *
+ * @param soc_pct State of Charge percentage.
+ */
 void webrtc_set_soc(float soc_pct) {
   // Stored as shared telemetry state and packed into outgoing sensor frames.
   g_soc_pct = soc_pct;
 }
 
+/**
+ * @brief Sets the streaming rate for the WebRTC data channel.
+ *
+ * @param rate_hz Streaming rate in Hertz (clamped between 10 and 100).
+ */
 void webrtc_set_stream_rate(int rate_hz) {
   // Keep rate bounded to protect bandwidth and task scheduling jitter.
   // Rate update is independent from stream_active (set by separate controls).
@@ -302,6 +431,9 @@ void webrtc_set_stream_rate(int rate_hz) {
     }
 }
 
+/**
+ * @brief Pauses periodic data-channel telemetry streaming.
+ */
 void webrtc_stop_stream(void) {
     // Pause periodic data-channel sends without tearing down WebRTC transport.
     g_stream_active = false;

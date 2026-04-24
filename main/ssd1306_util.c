@@ -4,6 +4,13 @@
 
 static uint8_t buffer[SSD1306_WIDTH * SSD1306_HEIGHT / 8];
 
+/**
+ * @brief Writes a byte to the SSD1306 display via I2C.
+ *
+ * @param reg Register address (0x00 for command, 0x40 for data).
+ * @param data Byte to write.
+ * @return ESP_OK on success.
+ */
 static esp_err_t ssd1306_write_byte(uint8_t reg, uint8_t data) {
     // reg=0x00 for command stream, reg=0x40 for display RAM data stream.
     i2c_cmd_handle_t cmd = i2c_cmd_link_create();
@@ -17,12 +24,19 @@ static esp_err_t ssd1306_write_byte(uint8_t reg, uint8_t data) {
     return ret;
 }
 
-// Write command
+/**
+ * @brief Sends a command byte to the SSD1306 display.
+ *
+ * @param command The command byte.
+ */
 static void ssd1306_command(uint8_t command) {
     ssd1306_write_byte(0x00, command);
 }
 
 
+/**
+ * @brief Initializes the shared I2C master bus.
+ */
 void i2c_master_init(void) {
     // Shared I2C bus for both OLED and INA219.
     i2c_config_t conf = {
@@ -37,6 +51,11 @@ void i2c_master_init(void) {
     i2c_driver_install(I2C_MASTER_NUM, conf.mode, I2C_MASTER_RX_BUF_DISABLE, I2C_MASTER_TX_BUF_DISABLE, 0);
 }
 
+/**
+ * @brief Initializes the SSD1306 OLED display.
+ *
+ * Sends the initialization sequence and clears the display buffer.
+ */
 void ssd1306_init(void) {
     // Initialization Sequence
     ssd1306_command(0xAE); // Display OFF
@@ -70,25 +89,51 @@ void ssd1306_init(void) {
     ssd1306_update_display();
 }
 
+/**
+ * @brief Clears the internal display buffer.
+ */
 void ssd1306_clear_buffer(void) {
     memset(buffer, 0, sizeof(buffer));
 }
 
+/**
+ * @brief Clears both the internal buffer and updates the physical display.
+ */
 void ssd1306_display_clear(void) {
     ssd1306_clear_buffer();
     ssd1306_update_display();
 }
 
+/**
+ * @brief Draws a single pixel to the internal buffer.
+ *
+ * @param x X coordinate (0-127).
+ * @param y Y coordinate (0-63 for 128x64 or 0-31 for 128x32).
+ * @param color 1 for ON, 0 for OFF.
+ */
 void ssd1306_draw_pixel(int x, int y, int color) {
     if (x >= SSD1306_WIDTH || y >= SSD1306_HEIGHT) return;
-    // Framebuffer is arranged in 8-pixel-tall pages (vertical bits per byte).
+    
+    // The SSD1306 RAM structure isn't a standard linear framebuffer. 
+    // It's organized into "pages" that are 8 pixels tall. Each byte represents a vertical column of 8 pixels.
+    // x determines the column offset, and (y / 8) determines which of the horizontal pages we are in.
+    int index = x + (y / 8) * SSD1306_WIDTH;
+    
+    // The specific pixel inside that byte is addressed by the remainder of the Y coordinate (y % 8).
     if (color) {
-        buffer[x + (y / 8) * SSD1306_WIDTH] |= (1 << (y % 8));
+        buffer[index] |= (1 << (y % 8));  // Set the bit to turn the pixel ON
     } else {
-        buffer[x + (y / 8) * SSD1306_WIDTH] &= ~(1 << (y % 8));
+        buffer[index] &= ~(1 << (y % 8)); // Clear the bit to turn the pixel OFF
     }
 }
 
+/**
+ * @brief Draws a single 8x8 character to the internal buffer.
+ *
+ * @param x X coordinate.
+ * @param y Y coordinate.
+ * @param c The character to draw.
+ */
 void ssd1306_draw_char(int x, int y, char c) {
     if (x > SSD1306_WIDTH - 8 || y > SSD1306_HEIGHT - 8) return;
     
@@ -96,9 +141,11 @@ void ssd1306_draw_char(int x, int y, char c) {
     // if (c < 0 || c > 127) c = '?'; // Removing this check as char might be unsigned or signed depending on compiler
 
     for (int i = 0; i < 8; i++) {
-        // font8x8_basic stores one byte per column for each glyph row set.
+        // The 8x8 font array provides 8 bytes per character.
+        // Each byte corresponds to a column (i), and the bits in the byte represent the rows (j).
         uint8_t line = font8x8_basic[(uint8_t)c][i];
         for (int j = 0; j < 8; j++) {
+            // Check if the j-th bit is set, indicating a filled pixel for this font glyph.
             if (line & (1 << j)) {
                 ssd1306_draw_pixel(x + i, y + j, 1);
             }
@@ -106,6 +153,13 @@ void ssd1306_draw_char(int x, int y, char c) {
     }
 }
 
+/**
+ * @brief Writes a string of text to the internal buffer at a specific page and column.
+ *
+ * @param page The text page (Y position divided by 8).
+ * @param col The X column coordinate.
+ * @param text The null-terminated string to draw.
+ */
 void ssd1306_set_text(int page, int col, char *text) {
     int x = col;
     int y = page * 8;
@@ -121,11 +175,21 @@ void ssd1306_set_text(int page, int col, char *text) {
     }
 }
 
+/**
+ * @brief Writes text to the buffer and immediately updates the display.
+ *
+ * @param page The text page (Y position divided by 8).
+ * @param col The X column coordinate.
+ * @param text The null-terminated string to draw.
+ */
 void ssd1306_display_text(int page, int col, char *text) {
     ssd1306_set_text(page, col, text);
     ssd1306_update_display();
 }
 
+/**
+ * @brief Flushes the internal buffer to the physical OLED display.
+ */
 void ssd1306_update_display(void) {
     for (uint8_t i = 0; i < SSD1306_HEIGHT / 8; i++) {
         ssd1306_command(0xB0 + i); // Set Page Start Address
