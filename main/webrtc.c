@@ -11,6 +11,7 @@
 #include <math.h>
 
 static const char *TAG = "webrtc";
+#define ENABLE_WEBRTC_TRACE 1
 
 static PeerConnection    *g_pc            = NULL;
 static SemaphoreHandle_t  g_pc_mutex      = NULL;
@@ -21,6 +22,9 @@ static volatile bool      g_dc_open       = false;
 static volatile float     g_soc_pct       = 100.0f;
 static volatile int       g_stream_rate   = 50;   // Hz
 static volatile bool      g_stream_active = true;
+static uint32_t           g_tx_packets    = 0;
+static uint32_t           g_tx_bytes      = 0;
+static uint32_t           g_rx_messages   = 0;
 
 /* Mock sine-wave parameters matching JS app's ACTIVE_JOINTS order:
  * [0] left-elbow  [1] right-elbow  [2] left-knee  [3] right-knee */
@@ -80,6 +84,9 @@ static void on_icestate(PeerConnectionState state, void *userdata) {
 static void on_local_description(char *sdp, void *userdata) {
     free(g_answer_sdp);
     g_answer_sdp = sdp ? strdup(sdp) : NULL;
+#if ENABLE_WEBRTC_TRACE
+    ESP_LOGI(TAG, "local description ready (answer len=%d)", sdp ? (int)strlen(sdp) : 0);
+#endif
     xSemaphoreGive(g_answer_ready);
 }
 
@@ -87,6 +94,9 @@ static void on_dc_open(void *userdata) {
     ESP_LOGI(TAG, "data channel open");
     g_dc_open       = true;
     g_stream_active = true;
+    g_tx_packets    = 0;
+    g_tx_bytes      = 0;
+    g_rx_messages   = 0;
 }
 
 static void on_dc_close(void *userdata) {
@@ -95,7 +105,12 @@ static void on_dc_close(void *userdata) {
 }
 
 static void on_dc_message(char *msg, size_t len, void *userdata, uint16_t sid) {
+    g_rx_messages++;
+#if ENABLE_WEBRTC_TRACE
+    ESP_LOGI(TAG, "dc rx sid=%u len=%d count=%lu", sid, (int)len, (unsigned long)g_rx_messages);
+#else
     ESP_LOGD(TAG, "rx %d bytes from browser", (int)len);
+#endif
 }
 
 /* ── FreeRTOS tasks ─────────────────────────────────────────────────────── */
@@ -111,6 +126,7 @@ static void peer_main_task(void *pv) {
 
 static void streaming_task(void *pv) {
     uint8_t payload[32];
+    int64_t last_stat_log_us = 0;
     while (1) {
         if (!g_dc_open || !g_stream_active) {
             vTaskDelay(pdMS_TO_TICKS(100));
@@ -121,9 +137,24 @@ static void streaming_task(void *pv) {
 
         xSemaphoreTake(g_pc_mutex, portMAX_DELAY);
         if (g_pc && g_dc_open) {
-            peer_connection_datachannel_send(g_pc, (char *)payload, 32);
+            int rc = peer_connection_datachannel_send(g_pc, (char *)payload, 32);
+            if (rc < 0) {
+                ESP_LOGW(TAG, "dc tx failed rc=%d", rc);
+            } else {
+                g_tx_packets++;
+                g_tx_bytes += 32;
+            }
         }
         xSemaphoreGive(g_pc_mutex);
+
+#if ENABLE_WEBRTC_TRACE
+        if (last_stat_log_us == 0 || (now - last_stat_log_us) >= 2000000) {
+            ESP_LOGI(TAG, "dc tx packets=%lu bytes=%lu rate=%dHz active=%d",
+                     (unsigned long)g_tx_packets, (unsigned long)g_tx_bytes,
+                     g_stream_rate, g_stream_active ? 1 : 0);
+            last_stat_log_us = now;
+        }
+#endif
 
         vTaskDelay(pdMS_TO_TICKS(1000 / g_stream_rate));
     }
@@ -146,14 +177,6 @@ esp_err_t webrtc_init(void) {
     g_offer_lock   = xSemaphoreCreateMutex();
     g_answer_ready = xSemaphoreCreateBinary();
 
-    PeerConfiguration cfg = make_config();
-    g_pc = peer_connection_create(&cfg);
-    if (!g_pc) {
-        ESP_LOGE(TAG, "peer_connection_create failed");
-        return ESP_FAIL;
-    }
-    setup_callbacks();
-
     xTaskCreate(peer_main_task, "peer_main",   8192, NULL, 6, NULL);
     xTaskCreate(streaming_task, "peer_stream", 3072, NULL, 5, NULL);
 
@@ -162,21 +185,26 @@ esp_err_t webrtc_init(void) {
 }
 
 esp_err_t webrtc_handle_offer(const char *offer_sdp, char **answer_out) {
-    if (!g_pc) return ESP_ERR_INVALID_STATE;
-
     if (xSemaphoreTake(g_offer_lock, pdMS_TO_TICKS(100)) != pdTRUE)
         return ESP_ERR_TIMEOUT;
+
+#if ENABLE_WEBRTC_TRACE
+    ESP_LOGI(TAG, "handling offer (len=%d)", offer_sdp ? (int)strlen(offer_sdp) : 0);
+#endif
 
     /* Drain any stale answer signal from a previous exchange */
     xSemaphoreTake(g_answer_ready, 0);
     free(g_answer_sdp);
     g_answer_sdp = NULL;
 
-    /* Recreate the peer connection on each new offer (handles browser refresh) */
+    /* Create/recreate peer connection for each new offer (handles browser refresh) */
     xSemaphoreTake(g_pc_mutex, portMAX_DELAY);
     g_dc_open = false;
-    peer_connection_close(g_pc);
-    peer_connection_destroy(g_pc);
+    if (g_pc) {
+        peer_connection_close(g_pc);
+        peer_connection_destroy(g_pc);
+        g_pc = NULL;
+    }
 
     PeerConfiguration cfg = make_config();
     g_pc = peer_connection_create(&cfg);
@@ -202,6 +230,9 @@ esp_err_t webrtc_handle_offer(const char *offer_sdp, char **answer_out) {
 
     if (!g_answer_sdp) return ESP_FAIL;
     *answer_out = g_answer_sdp;
+#if ENABLE_WEBRTC_TRACE
+    ESP_LOGI(TAG, "offer handled, answer ready (len=%d)", (int)strlen(g_answer_sdp));
+#endif
     g_answer_sdp = NULL;
     return ESP_OK;
 }
@@ -213,8 +244,15 @@ void webrtc_free_answer(char *answer) {
 esp_err_t webrtc_add_ice_candidate(const char *candidate) {
     if (!g_pc) return ESP_ERR_INVALID_STATE;
     xSemaphoreTake(g_pc_mutex, portMAX_DELAY);
-    peer_connection_add_ice_candidate(g_pc, (char *)candidate);
+    int rc = peer_connection_add_ice_candidate(g_pc, (char *)candidate);
     xSemaphoreGive(g_pc_mutex);
+    if (rc < 0) {
+        ESP_LOGW(TAG, "add ICE candidate failed rc=%d", rc);
+        return ESP_FAIL;
+    }
+#if ENABLE_WEBRTC_TRACE
+    ESP_LOGI(TAG, "ICE candidate added");
+#endif
     return ESP_OK;
 }
 
@@ -227,9 +265,17 @@ void webrtc_set_soc(float soc_pct) {
 }
 
 void webrtc_set_stream_rate(int rate_hz) {
-    if (rate_hz >= 10 && rate_hz <= 100) g_stream_rate = rate_hz;
+    if (rate_hz >= 10 && rate_hz <= 100) {
+        g_stream_rate = rate_hz;
+#if ENABLE_WEBRTC_TRACE
+        ESP_LOGI(TAG, "stream rate set to %dHz", g_stream_rate);
+#endif
+    }
 }
 
 void webrtc_stop_stream(void) {
     g_stream_active = false;
+#if ENABLE_WEBRTC_TRACE
+    ESP_LOGI(TAG, "stream stopped");
+#endif
 }

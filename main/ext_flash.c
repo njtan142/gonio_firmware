@@ -34,8 +34,8 @@ esp_err_t ext_flash_init(void) {
         .host_id   = EXT_SPI_HOST,
         .cs_id     = 0,
         .cs_io_num = EXT_CS_IO,
-        .io_mode   = SPI_FLASH_DIO,
-        .freq_mhz  = 40,
+        .io_mode   = SPI_FLASH_SLOWRD,
+        .freq_mhz  = 10,
     };
     ESP_RETURN_ON_ERROR(spi_bus_add_flash_device(&s_ext_flash, &dev_cfg),
                         TAG, "Add flash device failed");

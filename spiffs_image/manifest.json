@@ -1,8 +1,8 @@
 {
-  "timestamp": "2026-04-24T04:48:19.625Z",
+  "timestamp": "2026-04-24T19:38:47.301Z",
   "totalFiles": 8,
-  "originalSize": 3419126,
-  "compressedSize": 1208867,
+  "originalSize": 3416297,
+  "compressedSize": 1209018,
   "compressionRatio": "64.6%",
   "files": [
     {
@@ -27,10 +27,10 @@
       "gzipped": true
     },
     {
-      "path": "/c/BKRt__gA.js",
+      "path": "/c/5rYZhB5e.js",
       "mimeType": "text/javascript",
       "originalSize": 8810,
-      "compressedSize": 4028,
+      "compressedSize": 4030,
       "gzipped": true
     },
     {
@@ -41,17 +41,17 @@
       "gzipped": true
     },
     {
-      "path": "/Dm6t6i07.js",
+      "path": "/CPM6zRsF.js",
       "mimeType": "text/javascript",
-      "originalSize": 674664,
-      "compressedSize": 175399,
+      "originalSize": 676218,
+      "compressedSize": 175865,
       "gzipped": true
     },
     {
       "path": "/index.html",
       "mimeType": "text/html",
-      "originalSize": 43095,
-      "compressedSize": 5048,
+      "originalSize": 38712,
+      "compressedSize": 4731,
       "gzipped": true
     },
     {
