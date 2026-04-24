@@ -6,6 +6,7 @@
 #include "esp_spiffs.h"
 #include "esp_log.h"
 #include "esp_check.h"
+#include <dirent.h>
 
 static const char *TAG = "ext_flash";
 
@@ -48,13 +49,13 @@ esp_err_t ext_flash_init(void) {
     const esp_partition_t *part;
     ESP_RETURN_ON_ERROR(
         esp_partition_register_external(s_ext_flash, 0, s_ext_flash->size,
-                                        "spiffs", ESP_PARTITION_TYPE_DATA,
+                                        "ext_spiffs", ESP_PARTITION_TYPE_DATA,
                                         ESP_PARTITION_SUBTYPE_DATA_SPIFFS, &part),
         TAG, "Partition register failed");
 
     esp_vfs_spiffs_conf_t spiffs_cfg = {
         .base_path            = "/spiffs",
-        .partition_label      = "spiffs",
+        .partition_label      = "ext_spiffs",
         .max_files            = 10,
         .format_if_mount_failed = false,
     };
@@ -67,7 +68,18 @@ esp_err_t ext_flash_init(void) {
     }
 
     size_t total = 0, used = 0;
-    esp_spiffs_info("spiffs", &total, &used);
+    esp_spiffs_info("ext_spiffs", &total, &used);
     ESP_LOGI(TAG, "SPIFFS: total=%d  used=%d", total, used);
+
+    DIR *d = opendir("/spiffs");
+    if (d) {
+        ESP_LOGI(TAG, "SPIFFS root contents:");
+        struct dirent *ent;
+        while ((ent = readdir(d)) != NULL)
+            ESP_LOGI(TAG, "  %s", ent->d_name);
+        closedir(d);
+    } else {
+        ESP_LOGW(TAG, "opendir(/spiffs) failed");
+    }
     return ESP_OK;
 }

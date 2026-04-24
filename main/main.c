@@ -12,6 +12,7 @@
 #include "ssd1306_util.h"
 #include "ext_flash.h"
 #include "web_server.h"
+#include "webrtc.h"
 
 static const char *TAG = "coulomb";
 
@@ -81,6 +82,7 @@ static void ui_task(void *pv) {
     soc_percent -= (float)(delta_mas / BATTERY_CAPACITY_MAS * 100.0);
     if (soc_percent < 0.0f)   soc_percent = 0.0f;
     if (soc_percent > 100.0f) soc_percent = 100.0f;
+    webrtc_set_soc(soc_percent);
 
     xSemaphoreTake(i2c_mutex, portMAX_DELAY);
     float voltage    = ina219_read_bus_voltage();
@@ -122,6 +124,7 @@ void app_main(void) {
   if (ext_flash_init() == ESP_OK) {
     wifi_init_softap();
     web_server_start();
+    webrtc_init();
   }
 
   counter_mutex = xSemaphoreCreateMutex();

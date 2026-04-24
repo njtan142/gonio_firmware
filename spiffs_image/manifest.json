@@ -1,9 +1,9 @@
 {
-  "timestamp": "2026-04-23T19:19:10.311Z",
+  "timestamp": "2026-04-24T04:48:19.625Z",
   "totalFiles": 8,
-  "originalSize": 3403074,
-  "compressedSize": 1206857,
-  "compressionRatio": "64.5%",
+  "originalSize": 3419126,
+  "compressedSize": 1208867,
+  "compressionRatio": "64.6%",
   "files": [
     {
       "path": "/a/index.css",
@@ -27,10 +27,10 @@
       "gzipped": true
     },
     {
-      "path": "/c/BJvM6tO2.js",
+      "path": "/c/BKRt__gA.js",
       "mimeType": "text/javascript",
       "originalSize": 8810,
-      "compressedSize": 4029,
+      "compressedSize": 4028,
       "gzipped": true
     },
     {
@@ -41,17 +41,17 @@
       "gzipped": true
     },
     {
-      "path": "/DomFmr6W.js",
+      "path": "/Dm6t6i07.js",
       "mimeType": "text/javascript",
-      "originalSize": 670976,
-      "compressedSize": 173828,
+      "originalSize": 674664,
+      "compressedSize": 175399,
       "gzipped": true
     },
     {
       "path": "/index.html",
       "mimeType": "text/html",
-      "originalSize": 30731,
-      "compressedSize": 4608,
+      "originalSize": 43095,
+      "compressedSize": 5048,
       "gzipped": true
     },
     {
