@@ -453,6 +453,14 @@ int peer_connection_loop(PeerConnection* pc) {
 
         if (pc->config.datachannel) {
           LOGI("SCTP create socket");
+          // TODO: investigate ~60s delay between ICE connected and data channel open.
+          // Hypothesis: dtls_srtp_write (called here to send SCTP INIT) retries on
+          // MBEDTLS_ERR_SSL_WANT_READ, which drives the BIO recv callback; that callback
+          // polls agent_recv while still in PEER_CONNECTION_CONNECTED state and may consume
+          // Chrome's SCTP INIT-ACK before the COMPLETED state loop can process it. Chrome
+          // then retransmits with exponential backoff (~60s). Possible fix: break the
+          // WANT_READ retry in dtls_srtp_write when state != PEER_CONNECTION_CONNECTED, or
+          // drain mbedTLS's internal application-data buffer at the start of COMPLETED state.
           sctp_create_association(&pc->sctp, &pc->dtls_srtp);
           pc->sctp.userdata = pc->config.user_data;
         }
