@@ -18,6 +18,7 @@
 #define POWER_LSB_MW        20.0f
 
 static esp_err_t ina219_write_reg(uint8_t reg, uint16_t value) {
+    // INA219 registers are big-endian; write MSB first.
     i2c_cmd_handle_t cmd = i2c_cmd_link_create();
     i2c_master_start(cmd);
     i2c_master_write_byte(cmd, (INA219_I2C_ADDRESS << 1) | I2C_MASTER_WRITE, true);
@@ -32,6 +33,7 @@ static esp_err_t ina219_write_reg(uint8_t reg, uint16_t value) {
 
 static esp_err_t ina219_read_reg(uint8_t reg, uint16_t *value) {
     uint8_t buf[2];
+    // Standard register-pointer write then repeated-start read.
     i2c_cmd_handle_t cmd = i2c_cmd_link_create();
     i2c_master_start(cmd);
     i2c_master_write_byte(cmd, (INA219_I2C_ADDRESS << 1) | I2C_MASTER_WRITE, true);
@@ -50,9 +52,10 @@ static esp_err_t ina219_read_reg(uint8_t reg, uint16_t *value) {
 }
 
 esp_err_t ina219_init(void) {
-    // 32V range, ±320mV shunt, 12-bit, continuous
+    // 32V bus range, ±320mV shunt range, 12-bit ADC, continuous conversion.
     esp_err_t ret = ina219_write_reg(INA219_REG_CONFIG, 0x399F);
     if (ret != ESP_OK) return ret;
+    // Calibration config defines current/power scaling used by read_current/power.
     return ina219_write_reg(INA219_REG_CALIB, INA219_CALIB_VALUE);
 }
 
@@ -65,6 +68,7 @@ float ina219_read_bus_voltage(void) {
 float ina219_read_current(void) {
     uint16_t raw = 0;
     ina219_read_reg(INA219_REG_CURRENT, &raw);
+    // Board wiring makes discharge current negative; invert for positive draw.
     return -(int16_t)raw * CURRENT_LSB_MA;
 }
 

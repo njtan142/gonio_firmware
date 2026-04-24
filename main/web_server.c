@@ -16,6 +16,7 @@
 
 static const char *TAG = "web_server";
 #define ENABLE_SIGNALING_TRACE 1
+// Fallback client address captured from AP events when socket peer lookup fails.
 static char g_last_sta_ip[INET_ADDRSTRLEN] = "";
 
 #define WIFI_SSID "ESP32-Monitor"
@@ -33,6 +34,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     ESP_LOGI(TAG, "Station left AID=%d", e->aid);
   } else if (event_base == IP_EVENT &&
              event_id == IP_EVENT_AP_STAIPASSIGNED) {
+    // Cache most recent station IP for later SDP/ICE mDNS rewrites.
     ip_event_ap_staipassigned_t *e = event_data;
     snprintf(g_last_sta_ip, sizeof(g_last_sta_ip), IPSTR, IP2STR(&e->ip));
     ESP_LOGI(TAG, "Station got IP: %s", g_last_sta_ip);
@@ -48,6 +50,7 @@ void wifi_init_softap(void) {
   }
   ESP_ERROR_CHECK(ret);
 
+  // AP mode networking stack + default event loop.
   ESP_ERROR_CHECK(esp_netif_init());
   ESP_ERROR_CHECK(esp_event_loop_create_default());
   esp_netif_create_default_wifi_ap();
@@ -103,6 +106,7 @@ static bool get_client_ip(httpd_req_t *req, char *out, size_t out_len) {
   }
 
   if (addr.ss_family == AF_INET6) {
+    // Handle IPv4-mapped IPv6 form (::ffff:a.b.c.d) emitted by some stacks.
     struct sockaddr_in6 *in6 = (struct sockaddr_in6 *)&addr;
     const uint8_t *a = in6->sin6_addr.s6_addr;
     bool mapped_v4 = true;
@@ -148,6 +152,7 @@ static bool rewrite_candidate_address(const char *candidate, const char *ip,
       tok_len++;
     }
 
+    // ICE candidate token #4 is the connection-address (RFC 5245 grammar).
     if (field == 4 && tok_len >= 6) {
       for (size_t i = 0; i + 6 <= tok_len; i++) {
         if (memcmp(tok + i, ".local", 6) == 0) {
@@ -201,6 +206,7 @@ static bool candidate_is_udp(const char *candidate) {
       tok_len++;
     }
 
+    // ICE candidate token #2 is the transport protocol (UDP/TCP).
     if (field == 2) {
       return (tok_len == 3 && (tok[0] == 'U' || tok[0] == 'u') &&
               (tok[1] == 'D' || tok[1] == 'd') &&
@@ -233,6 +239,7 @@ static esp_err_t sanitize_offer_sdp(const char *offer_sdp, const char *client_ip
 
   sanitized[0] = '\0';
   cursor = work;
+  // Process line-by-line so we can selectively rewrite/drop candidate lines.
   while (cursor && *cursor) {
     char *next = strchr(cursor, '\n');
     line = cursor;
@@ -248,6 +255,8 @@ static esp_err_t sanitize_offer_sdp(const char *offer_sdp, const char *client_ip
       line[len - 1] = '\0';
     }
 
+    // Keep signaling robust on ESP32 by accepting only UDP candidates and
+    // rewriting mDNS hostnames to the caller IP when possible.
     if (strncmp(line, "a=candidate:", 12) == 0) {
       const char *candidate_to_append = line;
 
@@ -297,6 +306,7 @@ static esp_err_t sanitize_offer_sdp(const char *offer_sdp, const char *client_ip
 }
 
 static bool extract_first_mid(const char *sdp, char *out, size_t out_len) {
+  // Use the first media-id as canonical across rewritten answer lines.
   const char *mid = strstr(sdp, "a=mid:");
   if (!mid || out_len < 2)
     return false;
@@ -358,6 +368,8 @@ static esp_err_t normalize_answer_sdp_mid(const char *answer_sdp,
 
     const char *line_out = line;
     char rewritten_line[96];
+    // Some browsers reject the answer if BUNDLE/mid values do not mirror the
+    // offer exactly; force the answer to use the offer's first mid token.
     if (strncmp(line, "a=mid:", 6) == 0) {
       snprintf(rewritten_line, sizeof(rewritten_line), "a=mid:%s", offer_mid);
       line_out = rewritten_line;
@@ -400,6 +412,7 @@ static esp_err_t read_body(httpd_req_t *req, char **out) {
     return ESP_FAIL;
   }
   int received = 0;
+  // Read until full Content-Length to avoid parsing partial JSON payloads.
   while (received < len) {
     int r = httpd_req_recv(req, buf + received, len - received);
     if (r <= 0) {
@@ -437,6 +450,7 @@ static esp_err_t http_get_handler(httpd_req_t *req) {
   snprintf(filepath_gz, sizeof(filepath_gz), "%s.gz", filepath);
 
   bool is_gzip = false;
+  // Prefer precompressed assets when available to reduce transfer time.
   FILE *f = fopen(filepath_gz, "rb");
   if (f) {
     is_gzip = true;
@@ -545,6 +559,7 @@ static esp_err_t api_offer_handler(httpd_req_t *req) {
     return ESP_FAIL;
   }
 
+  // This call blocks until webrtc.c posts the local answer SDP.
   err = webrtc_handle_offer(sanitized_offer_sdp, &answer_sdp);
 
   if (err != ESP_OK || !answer_sdp) {
@@ -619,6 +634,7 @@ static esp_err_t api_ice_handler(httpd_req_t *req) {
       return ESP_FAIL;
     }
 
+    // Ignore non-UDP trickle candidates: current transport path is UDP only.
     if (!candidate_is_udp(candidate)) {
       ESP_LOGI(TAG, "Dropped non-UDP trickle ICE candidate");
       free(rewritten);
@@ -725,6 +741,7 @@ void web_server_start(void) {
       {.uri = "/api/stop", .method = HTTP_POST, .handler = api_stop_handler},
       {.uri = "/api/zero", .method = HTTP_POST, .handler = api_zero_handler},
   };
+  // Register explicit handlers first; static-file fallback is done via 404.
   for (int i = 0; i < 6; i++) {
     httpd_register_uri_handler(server, &routes[i]);
   }

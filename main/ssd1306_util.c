@@ -5,6 +5,7 @@
 static uint8_t buffer[SSD1306_WIDTH * SSD1306_HEIGHT / 8];
 
 static esp_err_t ssd1306_write_byte(uint8_t reg, uint8_t data) {
+    // reg=0x00 for command stream, reg=0x40 for display RAM data stream.
     i2c_cmd_handle_t cmd = i2c_cmd_link_create();
     i2c_master_start(cmd);
     i2c_master_write_byte(cmd, (SSD1306_I2C_ADDRESS << 1) | I2C_MASTER_WRITE, true);
@@ -23,6 +24,7 @@ static void ssd1306_command(uint8_t command) {
 
 
 void i2c_master_init(void) {
+    // Shared I2C bus for both OLED and INA219.
     i2c_config_t conf = {
         .mode = I2C_MODE_MASTER,
         .sda_io_num = I2C_MASTER_SDA_IO,
@@ -48,7 +50,7 @@ void ssd1306_init(void) {
     ssd1306_command(0x8D); // Charge Pump
     ssd1306_command(0x14); // Enable Charge Pump
     ssd1306_command(0x20); // Memory Addressing Mode
-    ssd1306_command(0x00); // Horizontal connection
+    ssd1306_command(0x00); // Horizontal addressing mode
     ssd1306_command(0xA1); // Segment Remap 0 to 127
     ssd1306_command(0xC8); // COM Output Scan Direction
     ssd1306_command(0xDA); // Set COM Pins Hardware Config
@@ -79,6 +81,7 @@ void ssd1306_display_clear(void) {
 
 void ssd1306_draw_pixel(int x, int y, int color) {
     if (x >= SSD1306_WIDTH || y >= SSD1306_HEIGHT) return;
+    // Framebuffer is arranged in 8-pixel-tall pages (vertical bits per byte).
     if (color) {
         buffer[x + (y / 8) * SSD1306_WIDTH] |= (1 << (y % 8));
     } else {
@@ -93,6 +96,7 @@ void ssd1306_draw_char(int x, int y, char c) {
     // if (c < 0 || c > 127) c = '?'; // Removing this check as char might be unsigned or signed depending on compiler
 
     for (int i = 0; i < 8; i++) {
+        // font8x8_basic stores one byte per column for each glyph row set.
         uint8_t line = font8x8_basic[(uint8_t)c][i];
         for (int j = 0; j < 8; j++) {
             if (line & (1 << j)) {
@@ -109,6 +113,7 @@ void ssd1306_set_text(int page, int col, char *text) {
         ssd1306_draw_char(x, y, *text);
         x += 8;
         if (x >= SSD1306_WIDTH) {
+            // Wrap to the next text page when reaching the right edge.
             x = 0;
             y += 8;
         }
@@ -131,6 +136,7 @@ void ssd1306_update_display(void) {
         i2c_master_start(cmd);
         i2c_master_write_byte(cmd, (SSD1306_I2C_ADDRESS << 1) | I2C_MASTER_WRITE, true);
         i2c_master_write_byte(cmd, 0x40, true); // Data mode
+        // Push one full page row (128 bytes) per transaction.
         i2c_master_write(cmd, &buffer[SSD1306_WIDTH * i], SSD1306_WIDTH, true);
         i2c_master_stop(cmd);
         i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(1000));
