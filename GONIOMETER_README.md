@@ -163,33 +163,62 @@ For upper-extremity: sensor 0 = Elbow, others configured per session.
 
 ---
 
-## 6. What This Project (`ssd1306_test`) Has Today
+## 6. Project Status
 
-- WiFi Soft-AP: `ESP32-Monitor`, password `12345678`
-- HTTP server on port 80 serving SPIFFS files
-- External SPI flash mounted as SPIFFS at `/spiffs`
-- INA219 coulomb counting + LiPo SoC estimation (already working)
-- SSD1306 display showing voltage, SoC%, mAh/s, SSID, IP
-- MT6701 SSI driver (`mt6701.c/h`):
-  - 4 sensors on SPI2 (shared with W25Q64), SPI Mode 3 (CPOL=1, CPHA=1)
-  - CS pins: GPIO 0 (Knee), GPIO 1 (Hip-yaw), GPIO 2 (Hip-pitch), GPIO 10 (Ankle-yaw)
-  - CRC-6 validation per frame (poly x⁶+x+1, confirmed against datasheet §6.8.2)
-  - Presence detection at boot — floating MISO (all-ones/all-zeros) rejected as false positives
-  - Sensor 0 (Knee/central) required; sensors 1–3 optional, absent slots output 0° silently
-  - Magnetic error flags encoded into telemetry status bits 9–6 per packet spec
-  - Real angle data replaces the JS mock sine-wave in the WebRTC streaming pipeline
+### ✅ Done
 
-**Missing (firmware):**
-- Zero-position calibration (`/api/zero` endpoint + per-sensor `θ_offset` storage)
-- Ring buffer (decoupled high-rate acquisition from network flush)
-- WebSocket streaming endpoint (`/ws`)
-- HTTP API endpoints (`/api/start`, `/api/stop`, `/api/status`)
-- UDP socket task
+**Firmware**
+| Item | Notes |
+|---|---|
+| WiFi Soft-AP | SSID `ESP32-Monitor`, password `12345678`, IP `192.168.4.1` |
+| HTTP server | Serves SPIFFS static assets on port 80 |
+| External SPI flash | W25Q64 8 MB on SPI2, SPIFFS mounted at `/spiffs` |
+| INA219 SoC | Coulomb counting at 100 Hz + OCV boot estimate |
+| SSD1306 display | Voltage, SoC%, mAh/s, SSID, IP — updates at 1 Hz |
+| MT6701 SSI driver | 4 sensors on SPI2, Mode 3, CRC-6 (x⁶+x+1), boot presence probe, magnetic error flags in telemetry |
+| WebRTC streaming | LFLL live data channel at 10–100 Hz; real sensor data, verified responsive in browser |
 
-**Missing (web app):**
-- WebSocket connection + binary parser
-- Real data replacing JS mock
-- Mode selector UI
-- 3D avatar animation from live data
-- IndexedDB session persistence
-- PDF report generation
+**Web App**
+| Item | Notes |
+|---|---|
+| Live gauge | Fed by WebRTC real data |
+| Live chart | Rolling 29-point buffer, fed by WebRTC real data |
+| Normative range overlay + warnings | Done |
+| Hold / freeze stream | Done |
+| Export CSV | Done |
+
+---
+
+### 🔧 In Progress
+
+**Web App**
+| Item | Blocking on |
+|---|---|
+| Set Zero button | JS UI done — needs `POST /api/zero` wired to firmware calibration |
+| Record / Stop | JS UI done — needs `POST /api/start` / `POST /api/stop` |
+| Battery % in sidebar | Hardcoded 92% — needs real SoC from packet or `/api/status` |
+| Live indicator | Always green — needs to reflect actual WebSocket/WebRTC connection state |
+| Sampling rate control | Slider exists — needs to send selected rate via `/api/start` |
+
+---
+
+### 📋 To Do
+
+**Firmware**
+| Item | Notes |
+|---|---|
+| Zero-position calibration | `/api/zero` handler + per-sensor `θ_offset` in NVS; corrected angle formula in §2.5 |
+| HTTP API | `/api/start`, `/api/stop`, `/api/status` endpoints |
+| TCP/WebSocket HFHL endpoint | `/ws` on port 80 — bulk-flush recording mode; no latency requirement but lossless |
+| Ring buffer | ~80 KB DRAM, ~2500 frames, drop-oldest, decouples sensor task from network flush |
+| FSM | `IDLE` ↔ `ACTIVE_READINGS` state machine with sensor power gating (§2.3) |
+| UDP socket task | LFLL native-client path; browser uses WebRTC data channel instead |
+
+**Web App**
+| Item | Notes |
+|---|---|
+| WebSocket connection + binary parser | Required for HFHL recording mode (`ws://192.168.4.1/ws`) |
+| Mode selector UI | UDP / TCP toggle before starting a session |
+| 3D avatar animation | Three.js bone rotation from live angle data; Play button currently no-op |
+| IndexedDB session persistence | In-memory only today; thesis requires IndexedDB |
+| PDF report generation | Not started; thesis specifies jsPDF |
