@@ -222,6 +222,7 @@ For upper-extremity: sensor 0 = Elbow, others configured per session.
 | TCP/WebSocket HFHL endpoint | `/ws` on port 80 — bulk-flush recording mode; no latency requirement but lossless |
 | Ring buffer | ~80 KB DRAM, ~2500 frames, drop-oldest, decouples sensor task from TCP/WebSocket flush (§2.2, §3.3) |
 | FSM | `IDLE` ↔ `ACTIVE_READINGS` state machine with sensor power gating (§2.3) |
+| Compiler optimization hardening | Race conditions in `webrtc.c` and `app_runtime.c` must be fixed first — see §7.4 |
 
 **Web App**
 | Item | Notes |
@@ -270,3 +271,18 @@ When `CONFIG_DATA_BUFFER_SIZE=0` was first applied, the browser received no data
 **Root cause:** `peer_connection_datachannel_send` always passes `sid=0` to `peer_connection_datachannel_send_sid`. In the buffered path, this `sid` was ignored — the drain code at `peer_connection.c:498` used `pc->sctp.data_sid` (the SID negotiated during `DATA_CHANNEL_OPEN`, which is 1). In the direct path (`#else` branch), `sid=0` was passed literally to `sctp_outgoing_data`. The browser discarded all SID-0 packets because no data channel is associated with SID 0.
 
 **Fix:** The `#else` branch in `peer_connection_datachannel_send_sid` (`peer_connection.c`) was updated to use `pc->sctp.data_sid` instead of the caller-supplied `sid`, making it consistent with the buffered path.
+
+### 7.4 Compiler Optimization — Not Yet Hardened
+
+Current build uses `-Og` (debug-friendly). The target is `-Os` (optimize for size), which would reclaim an estimated 100–200 KB of flash code space. The following race conditions exist in the codebase and are dormant under `-Og` but will manifest under `-Os` or `-O2`:
+
+**Critical**
+- `webrtc.c:37–39` — `g_tx_packets`, `g_tx_bytes`, `g_rx_messages` are plain `static uint32_t`. Written in `on_dc_message()` and reset in `on_dc_open()`, but read in `streaming_task()` with no mutex and no `volatile`. The compiler may cache these in registers. Fix: add `volatile`.
+- `webrtc.c:150–152` — Same counters are reset inside `on_dc_open()` (called from `peer_main_task`) while `streaming_task()` may be incrementing them simultaneously. Fix: wrap the reset in `g_pc_mutex` or use atomic operations.
+
+**High**
+- `webrtc.c:217–220` — `g_frames_per_packet` and `g_packet_freq_hz` are snapshotted as two separate volatile reads; not atomic. A task could change one parameter between the two reads, producing an inconsistent batch size. Fix: snapshot both under `g_pc_mutex` or pack into a single struct written atomically.
+- `webrtc.c:59` — `g_soc_pct` is `volatile float`. Volatile does not guarantee atomicity on floats; a torn write from `webrtc_set_soc()` during a read in `pack_frame()` can corrupt the value. Fix: read under mutex or copy to a local `uint8_t` before the cast.
+- `app_runtime.c:61,73` — `last_ts == 0` used as first-run sentinel. Under aggressive optimization the compiler may hoist or reorder this check. Fix: use a dedicated `bool first_sample` flag instead.
+
+Once all fixes are applied, switch via `idf.py menuconfig` → *Compiler options* → *Optimization Level* → **Optimize for size**, which sets `CONFIG_COMPILER_OPTIMIZATION_SIZE=y` in `sdkconfig`.
