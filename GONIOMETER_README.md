@@ -103,7 +103,7 @@ For a 4-sensor timestep, the ESP32 sends **4 × 8 = 32 bytes** sequentially.
 | `/*` | GET | Serve any static asset from SPIFFS (.js, .css, .gz) |
 | `/api/status` | GET | JSON: `{ soc, mode, rate, live }` |
 | `/api/zero` | POST | JSON body: `{ sensor: 0–3 }` — zero that sensor |
-| `/api/start` | POST | JSON body: `{ mode: "udp"\|"tcp", rate: 10–100 }` — begin streaming |
+| `/api/start` | POST | JSON body: `{ frames_per_packet: 1–46, packet_freq_hz: 10–400 }` — begin streaming |
 | `/api/stop` | POST | Stop streaming, return to IDLE |
 
 ---
@@ -139,18 +139,18 @@ function parseFrame(view: DataView, offset: number) {
 
 | Feature | Status |
 |---|---|
-| Live gauge (current joint angle) | UI done, needs real data feed |
-| Live chart (rolling 29-point buffer) | UI done, needs real data feed |
+| Live gauge (current joint angle) | Done — fed by WebRTC real data |
+| Live chart (rolling 29-point buffer) | Done — fed by WebRTC real data |
 | Normative range overlay + warnings | Done |
-| Hold / freeze stream | Done (JS mock) |
+| Hold / freeze stream | Done |
 | Set Zero (calibrate) | Done in JS; needs `POST /api/zero` call to firmware |
-| Record / Stop | Done in JS; should trigger `POST /api/start` / `POST /api/stop` |
+| Record / Stop | Done in JS; needs `POST /api/start` / `POST /api/stop` |
 | Export CSV | Done |
-| Battery % in sidebar | Hardcoded 92%; needs real SoC from packet or `/api/status` |
-| Live indicator in sidebar | Always green; should reflect WebSocket connection state |
+| Battery % in sidebar | Done — real SoC decoded from WebRTC packet |
+| Live indicator in sidebar | Done — reflects actual WebRTC data channel state |
+| Sampling rate control | Done — two sliders: Frames/pkt (1–46) and Pkt freq (10–400 Hz); displays Total readings/s |
 | 3D avatar animation | Three.js model loaded; Play button is a no-op — needs bone rotation from live data |
-| History persistence | In-memory only; thesis strategy updated to JSON export (local app) -> JSON import (PWA mirror) |
-| Sampling rate control | Slider exists; should send rate to firmware via `/api/start` |
+| History persistence | In-memory only; thesis strategy updated to JSON export (local app) → JSON import (PWA mirror) |
 | Mode selector (UDP/TCP) | Not in UI yet |
 | PDF report generation | Thesis specifies jsPDF — not implemented |
 
@@ -186,7 +186,8 @@ For upper-extremity: sensor 0 = Elbow, others configured per session.
 | INA219 SoC | Coulomb counting at 100 Hz + OCV boot estimate |
 | SSD1306 display | Voltage, SoC%, mAh/s, SSID, IP — updates at 1 Hz |
 | MT6701 SSI driver | 4 sensors on SPI2, Mode 3, CRC-6 (x⁶+x+1), boot presence probe, magnetic error flags in telemetry |
-| WebRTC streaming | LFLL live data channel at 10–100 Hz; real sensor data, verified responsive in browser |
+| WebRTC streaming | LFLL live data channel; batched packets (1–46 timesteps × 32 bytes), 10–400 Hz send rate; verified responsive in browser |
+| Dynamic payload batching | `streaming_task` batches `frames_per_packet` timesteps per DataChannel send; `/api/start` accepts `{ frames_per_packet, packet_freq_hz }` |
 
 **Web App**
 | Item | Notes |
@@ -196,6 +197,9 @@ For upper-extremity: sensor 0 = Elbow, others configured per session.
 | Normative range overlay + warnings | Done |
 | Hold / freeze stream | Done |
 | Export CSV | Done |
+| Battery % in sidebar | Real SoC decoded from WebRTC packet |
+| Live indicator | Reflects actual WebRTC data channel state |
+| Sampling rate UI | Two sliders: Frames/pkt (1–46) and Pkt freq (10–400 Hz); displays Total readings/s |
 
 ---
 
@@ -206,8 +210,6 @@ For upper-extremity: sensor 0 = Elbow, others configured per session.
 |---|---|
 | Set Zero button | JS UI done — needs `POST /api/zero` wired to firmware calibration |
 | Record / Stop | JS UI done — needs `POST /api/start` / `POST /api/stop` |
-| Battery % in sidebar | Hardcoded 92% — needs real SoC from packet or `/api/status` |
-| Live indicator | Always green — needs to reflect actual WebSocket/WebRTC connection state |
 
 ---
 
@@ -217,12 +219,9 @@ For upper-extremity: sensor 0 = Elbow, others configured per session.
 | Item | Notes |
 |---|---|
 | Zero-position calibration | `/api/zero` handler + per-sensor `θ_offset` in NVS; corrected angle formula in §2.5 |
-| HTTP API | `/api/start`, `/api/stop`, `/api/status` endpoints |
 | TCP/WebSocket HFHL endpoint | `/ws` on port 80 — bulk-flush recording mode; no latency requirement but lossless |
-| Ring buffer | ~80 KB DRAM, ~2500 frames, drop-oldest, decouples sensor task from network flush |
+| Ring buffer | ~80 KB DRAM, ~2500 frames, drop-oldest, decouples sensor task from TCP/WebSocket flush (§2.2, §3.3) |
 | FSM | `IDLE` ↔ `ACTIVE_READINGS` state machine with sensor power gating (§2.3) |
-| UDP socket task | LFLL native-client path; browser uses WebRTC data channel instead |
-| Dynamic Payload Batching | Implement `/api/start` parameters for `frames_per_packet` (1-120) and `packet_freq_hz` (10-400). Adjust `streaming_task` to batch frames into a single payload buffer before transmitting. |
 
 **Web App**
 | Item | Notes |
@@ -233,46 +232,41 @@ For upper-extremity: sensor 0 = Elbow, others configured per session.
 | Offline History (JSON Export/Import) | Requires JSON export button on ESP32 web app, and JSON import on PWA mirror |
 | PDF report generation | Not started; thesis specifies jsPDF |
 | WebRTC Latency Monitor | Real-time RTT/ping display in UI using `getStats()` API |
-| Advanced Sampling Rate UI | Replace single slider with two: 1) Readings per packet (increments of 4, max 120), 2) Packet transmission frequency (10Hz-400Hz). Display the resulting "Total Readings per Second". |
 
 ---
 
 ## 7. Findings & Limitations
 
-### 7.1 WebRTC Max Frequency & Buffer Exhaustion
-The thesis outlines a "Low Fidelity, Low Latency" (LFLL) mode utilizing UDP payload batching to achieve a high volume of readings per second. Specifically, the theoretical sampling ceiling is bounded by the network MTU, not just the packet transmission rate:
+### 7.1 WebRTC Payload Batching — Implemented
 
-*   **MTU Bound**: 1472 bytes per packet.
-*   **Frame Size**: 12 bytes per frame.
-*   **Maximum Readings per Packet ($N_{UDP}$)**: $1472 / 12 \approx 122$ frames (rounded to 120 max).
-*   **Packet Transmission Rate ($f_{tx}$)**: 60 Hz (16.6 ms window) default to match standard video capture synchronization.
-*   **Total Maximum Readings per Second**: $\approx 7,349 \text{ Hz}$ (calculated as 122 frames over a 16.6ms window, or exactly $122 \times 60 = 7,320$ readings/s).
+The theoretical sampling ceiling is MTU-bound, not rate-bound:
 
-Therefore, $7,349 \text{ Hz}$ is the **Total Maximum Readings per second**, *not* the packet send rate. The hardware can acquire data at 50,000Hz ($20\mu s$ per read), but the network bottleneck requires batching.
+*   **MTU Bound**: 1472 bytes per packet → max **46 timesteps** (4 sensors × 8 bytes × 46 = 1472 bytes).
+*   **Packet Transmission Rate ($f_{tx}$)**: 10–400 Hz, default 60 Hz.
+*   **Total Maximum Readings per Second**: 46 timesteps × 400 Hz = **18,400 Hz** (hardware acquires at 50,000 Hz; network is the ceiling).
 
-However, the **current implementation** sends exactly 1 frame (32 bytes representing 4 sensors) per `peer_connection_datachannel_send()` call. 
-When attempting to push the unbatched transmission frequency significantly above ~100-200Hz, the firmware generates thousands of individual WebRTC packets per second. This massive protocol overhead immediately overwhelms the ESP32 network stack, leading to exhaustion of the `libpeer` and lwIP internal buffers. This produces the following logs:
+**What was done:**
+- `streaming_task` now accumulates `g_frames_per_packet` (1–46) timesteps into a static batch buffer and calls `peer_connection_datachannel_send()` once per packet interval, reducing DTLS/SCTP encapsulation overhead by up to 46×.
+- `/api/start` accepts `{ frames_per_packet: N, packet_freq_hz: F }`.
+- Web app replaced the single rate slider with two independent sliders (Frames/pkt, Pkt freq) and a calculated Total readings/s display.
+- The web-side binary parser (`parsePacket`) handles variable-length packets (N × 32 bytes), dispatching one `onPacket` call per timestep.
 
-```text
-ERROR   ./components/libpeer/src/buffer.c       45      no enough space
-W (174438) webrtc: dc tx failed rc=-1
-ERROR   ./components/libpeer/src/buffer.c       45      no enough space
-W (174448) webrtc: dc tx failed rc=-1
-ERROR   ./components/libpeer/src/buffer.c       45      no enough space
-W (174458) webrtc: dc tx failed rc=-1
-ERROR   ./components/libpeer/src/buffer.c       45      no enough space
-W (174468) webrtc: dc tx failed rc=-1
-ERROR   ./components/libpeer/src/buffer.c       45      no enough space
-W (174478) webrtc: dc tx failed rc=-1
-ERROR   ./components/libpeer/src/buffer.c       45      no enough space
-W (174488) webrtc: dc tx failed rc=-1
-```
+### 7.2 libpeer Ring Buffer — Bypassed
 
-**Recommended Approaches to Fix or Gracefully Handle:**
-1. **Implement Dynamic Payload Batching UI (Thesis Method)**: Update the Web App to utilize **two sliders**:
-   - **Readings per Packet**: Increments of 4. Minimum of 1 (or 4 depending on active sensors). Maximum of 120.
-   - **Packet Transmission Frequency**: Minimum 10 Hz. Maximum 400 Hz (which assumes a 2.4ms max fill time of 122 readings times 20us per sensor reading). The maximum frequency slider must dynamically update based on the number of readings set per packet(if readings per packet is lower than 120 then max frequency should be higher) to avoid exceeding hardware limits. Default is 60 Hz.
-   - The UI must calculate and display **Total Readings per Second** (`Readings per Packet` × `Packet Frequency`).
-2. **Backend Batching**: Update the backend `streaming_task` to accumulate readings into a large array (up to 120 frames) and send them as a single packet. This drastically reduces DTLS/SCTP encapsulation overhead and aligns with the LFLL design.
-3. **Network Buffer Tuning**: Increase the lwIP UDP TX/RX buffers in `sdkconfig` and increase SCTP/DataChannel buffer sizes in `libpeer`. (Note: This only delays buffer-bloat and does not solve the CPU/network overhead bottleneck of unbatched frames).
-4. **Backpressure & Drop Policies**: Monitor the return code of `peer_connection_datachannel_send()`. If it returns `-1` (failure), intelligently drop frames at the sensor acquisition level rather than flooding the socket.
+**Root cause of `ERROR buffer.c:45 no enough space`:**
+
+`libpeer`'s internal `data_rb` TX ring buffer (32 KB, set by `CONFIG_DATA_BUFFER_SIZE=32768` in `components/libpeer/CMakeLists.txt`) was only drained inside `case PEER_CONNECTION_COMPLETED:` in `peer_connection_loop`. Any ICE state regression — connectivity check timeout, DTLS keepalive, browser losing focus — caused draining to stop while `streaming_task` kept pushing. The 32 KB buffer filled in ~15 seconds and every subsequent write failed.
+
+**Fundamental mismatch:** The ring buffer is designed for reliable media delivery (buffer → drain → retry later). The LFLL data channel uses `maxRetransmits: 0` (unreliable, drop-if-busy). These are incompatible. The ring buffer is the correct architecture for the HFHL TCP/WebSocket path (§2.2, §3.3), not for WebRTC LFLL.
+
+**Fix:** Set `CONFIG_DATA_BUFFER_SIZE=0` in `components/libpeer/CMakeLists.txt`. With zero, `peer_connection_datachannel_send` bypasses the ring buffer and calls `sctp_outgoing_data` directly. Packets are sent immediately or dropped silently at the DTLS level — correct LFLL behaviour. No ring buffer means no fill-and-deadlock possible.
+
+Note: the custom SCTP implementation (`CONFIG_USE_USRSCTP=0`) always returns success from `sctp_outgoing_data` regardless of DTLS send outcome, so Fix #4 (backpressure on return code) is not applicable in this code path.
+
+### 7.3 libpeer SCTP Stream ID Bug — Fixed
+
+When `CONFIG_DATA_BUFFER_SIZE=0` was first applied, the browser received no data despite the firmware reporting successful sends.
+
+**Root cause:** `peer_connection_datachannel_send` always passes `sid=0` to `peer_connection_datachannel_send_sid`. In the buffered path, this `sid` was ignored — the drain code at `peer_connection.c:498` used `pc->sctp.data_sid` (the SID negotiated during `DATA_CHANNEL_OPEN`, which is 1). In the direct path (`#else` branch), `sid=0` was passed literally to `sctp_outgoing_data`. The browser discarded all SID-0 packets because no data channel is associated with SID 0.
+
+**Fix:** The `#else` branch in `peer_connection_datachannel_send_sid` (`peer_connection.c`) was updated to use `pc->sctp.data_sid` instead of the caller-supplied `sid`, making it consistent with the buffered path.
