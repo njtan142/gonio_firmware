@@ -10,7 +10,7 @@ This document describes what the system needs to implement based on the thesis
 | Repo | URL | Contents |
 |---|---|---|
 | Firmware | *(local, no remote)* | ESP32-C3 firmware — this repo (`ssd1306_test`) |
-| Web App | https://github.com/njtan142/goniometer-web-app | Browser UI served from W25Q64 SPIFFS |
+| Web App | https://github.com/njtan142/goniometer-web-app | Single codebase built in two modes via ENV vars: 1) Local SPIFFS (ESP32 HTTP), 2) Vercel PWA (offline JSON playback) |
 
 ---
 
@@ -116,6 +116,7 @@ For a 4-sensor timestep, the ESP32 sends **4 × 8 = 32 bytes** sequentially.
 - **TCP mode**: open `ws://192.168.4.1/ws`, receive binary ArrayBuffers
 - **UDP mode**: browser cannot use raw UDP → implement via WebRTC data channel
   OR treat UDP-only as a native-client feature and use WebSocket for the web UI
+- **Offline PWA Mode**: Build configured via environment variables, hosted externally (e.g., Vercel) to allow importing `.json` recordings without ESP32 connection
 - Fall back to JS mock data when not connected to ESP32 (for dev/demo)
 
 ### 4.2 Binary Parser (web side)
@@ -148,7 +149,7 @@ function parseFrame(view: DataView, offset: number) {
 | Battery % in sidebar | Hardcoded 92%; needs real SoC from packet or `/api/status` |
 | Live indicator in sidebar | Always green; should reflect WebSocket connection state |
 | 3D avatar animation | Three.js model loaded; Play button is a no-op — needs bone rotation from live data |
-| History persistence | In-memory only; thesis specifies browser IndexedDB |
+| History persistence | In-memory only; thesis strategy updated to JSON export (local app) -> JSON import (PWA mirror) |
 | Sampling rate control | Slider exists; should send rate to firmware via `/api/start` |
 | Mode selector (UDP/TCP) | Not in UI yet |
 | PDF report generation | Thesis specifies jsPDF — not implemented |
@@ -229,5 +230,5 @@ For upper-extremity: sensor 0 = Elbow, others configured per session.
 | WebSocket connection + binary parser | Required for HFHL recording mode (`ws://192.168.4.1/ws`) |
 | Mode selector UI | UDP / TCP toggle before starting a session |
 | 3D avatar animation | Three.js bone rotation from live angle data; Play button currently no-op |
-| IndexedDB session persistence | In-memory only today; thesis requires IndexedDB |
+| Offline History (JSON Export/Import) | Requires JSON export button on ESP32 web app, and JSON import on PWA mirror |
 | PDF report generation | Not started; thesis specifies jsPDF |
