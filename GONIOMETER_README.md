@@ -5,6 +5,15 @@ This document describes what the system needs to implement based on the thesis
 
 ---
 
+## 0. Repository Layout
+
+| Repo | URL | Contents |
+|---|---|---|
+| Firmware | *(local, no remote)* | ESP32-C3 firmware — this repo (`ssd1306_test`) |
+| Web App | https://github.com/njtan142/goniometer-web-app | Browser UI served from W25Q64 SPIFFS |
+
+---
+
 ## 1. Hardware Stack
 
 | Component | Role |
