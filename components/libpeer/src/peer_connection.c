@@ -14,8 +14,8 @@
 #include "sctp.h"
 #include "sdp.h"
 #include "mbedtls/ssl.h"
+#include "app_config.h"
 
-#define ENABLE_PC_DATA_TRACE 0
 
 #define STATE_CHANGED(pc, curr_state)                                 \
   if (pc->oniceconnectionstatechange && pc->state != curr_state) {    \
@@ -77,7 +77,9 @@ static int peer_connection_dtls_srtp_recv(void* ctx, unsigned char* buf, size_t 
     ret = agent_recv(&pc->agent, buf, len);
 
     if (ret > 0) {
+#if ENABLE_PC_BIO_TRACE
       LOGI("BIO recv: %d bytes (type=0x%02x) after %dms", ret, buf[0], recv_max);
+#endif
       break;
     }
 
@@ -86,7 +88,9 @@ static int peer_connection_dtls_srtp_recv(void* ctx, unsigned char* buf, size_t 
   }
 
   if (ret <= 0) {
+#if ENABLE_PC_BIO_TRACE
     LOGI("BIO recv: timeout after %dms (state=%d)", recv_max, pc->state);
+#endif
     return MBEDTLS_ERR_SSL_WANT_READ;
   }
 
@@ -98,7 +102,9 @@ static int peer_connection_dtls_srtp_send(void* ctx, const uint8_t* buf, size_t 
   PeerConnection* pc = (PeerConnection*)dtls_srtp->user_data;
 
   int ret = agent_send(&pc->agent, buf, len);
+#if ENABLE_PC_BIO_TRACE
   LOGI("BIO send: %d bytes (type=0x%02x) ret=%d", (int)len, buf[0], ret);
+#endif
   if (ret <= 0) {
     return MBEDTLS_ERR_SSL_WANT_WRITE;
   }

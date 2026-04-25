@@ -208,7 +208,6 @@ For upper-extremity: sensor 0 = Elbow, others configured per session.
 | Record / Stop | JS UI done — needs `POST /api/start` / `POST /api/stop` |
 | Battery % in sidebar | Hardcoded 92% — needs real SoC from packet or `/api/status` |
 | Live indicator | Always green — needs to reflect actual WebSocket/WebRTC connection state |
-| Sampling rate control | Slider exists — needs to send selected rate via `/api/start` |
 
 ---
 
@@ -223,6 +222,7 @@ For upper-extremity: sensor 0 = Elbow, others configured per session.
 | Ring buffer | ~80 KB DRAM, ~2500 frames, drop-oldest, decouples sensor task from network flush |
 | FSM | `IDLE` ↔ `ACTIVE_READINGS` state machine with sensor power gating (§2.3) |
 | UDP socket task | LFLL native-client path; browser uses WebRTC data channel instead |
+| Dynamic Payload Batching | Implement `/api/start` parameters for `frames_per_packet` (1-120) and `packet_freq_hz` (10-400). Adjust `streaming_task` to batch frames into a single payload buffer before transmitting. |
 
 **Web App**
 | Item | Notes |
@@ -232,3 +232,47 @@ For upper-extremity: sensor 0 = Elbow, others configured per session.
 | 3D avatar animation | Three.js bone rotation from live angle data; Play button currently no-op |
 | Offline History (JSON Export/Import) | Requires JSON export button on ESP32 web app, and JSON import on PWA mirror |
 | PDF report generation | Not started; thesis specifies jsPDF |
+| WebRTC Latency Monitor | Real-time RTT/ping display in UI using `getStats()` API |
+| Advanced Sampling Rate UI | Replace single slider with two: 1) Readings per packet (increments of 4, max 120), 2) Packet transmission frequency (10Hz-400Hz). Display the resulting "Total Readings per Second". |
+
+---
+
+## 7. Findings & Limitations
+
+### 7.1 WebRTC Max Frequency & Buffer Exhaustion
+The thesis outlines a "Low Fidelity, Low Latency" (LFLL) mode utilizing UDP payload batching to achieve a high volume of readings per second. Specifically, the theoretical sampling ceiling is bounded by the network MTU, not just the packet transmission rate:
+
+*   **MTU Bound**: 1472 bytes per packet.
+*   **Frame Size**: 12 bytes per frame.
+*   **Maximum Readings per Packet ($N_{UDP}$)**: $1472 / 12 \approx 122$ frames (rounded to 120 max).
+*   **Packet Transmission Rate ($f_{tx}$)**: 60 Hz (16.6 ms window) default to match standard video capture synchronization.
+*   **Total Maximum Readings per Second**: $\approx 7,349 \text{ Hz}$ (calculated as 122 frames over a 16.6ms window, or exactly $122 \times 60 = 7,320$ readings/s).
+
+Therefore, $7,349 \text{ Hz}$ is the **Total Maximum Readings per second**, *not* the packet send rate. The hardware can acquire data at 50,000Hz ($20\mu s$ per read), but the network bottleneck requires batching.
+
+However, the **current implementation** sends exactly 1 frame (32 bytes representing 4 sensors) per `peer_connection_datachannel_send()` call. 
+When attempting to push the unbatched transmission frequency significantly above ~100-200Hz, the firmware generates thousands of individual WebRTC packets per second. This massive protocol overhead immediately overwhelms the ESP32 network stack, leading to exhaustion of the `libpeer` and lwIP internal buffers. This produces the following logs:
+
+```text
+ERROR   ./components/libpeer/src/buffer.c       45      no enough space
+W (174438) webrtc: dc tx failed rc=-1
+ERROR   ./components/libpeer/src/buffer.c       45      no enough space
+W (174448) webrtc: dc tx failed rc=-1
+ERROR   ./components/libpeer/src/buffer.c       45      no enough space
+W (174458) webrtc: dc tx failed rc=-1
+ERROR   ./components/libpeer/src/buffer.c       45      no enough space
+W (174468) webrtc: dc tx failed rc=-1
+ERROR   ./components/libpeer/src/buffer.c       45      no enough space
+W (174478) webrtc: dc tx failed rc=-1
+ERROR   ./components/libpeer/src/buffer.c       45      no enough space
+W (174488) webrtc: dc tx failed rc=-1
+```
+
+**Recommended Approaches to Fix or Gracefully Handle:**
+1. **Implement Dynamic Payload Batching UI (Thesis Method)**: Update the Web App to utilize **two sliders**:
+   - **Readings per Packet**: Increments of 4. Minimum of 1 (or 4 depending on active sensors). Maximum of 120.
+   - **Packet Transmission Frequency**: Minimum 10 Hz. Maximum 400 Hz (which assumes a 2.4ms max fill time). The maximum frequency slider must dynamically update based on the number of readings set per packet to avoid exceeding hardware limits. Default is 60 Hz.
+   - The UI must calculate and display **Total Readings per Second** (`Readings per Packet` × `Packet Frequency`).
+2. **Backend Batching**: Update the backend `streaming_task` to accumulate readings into a large array (up to 120 frames) and send them as a single packet. This drastically reduces DTLS/SCTP encapsulation overhead and aligns with the LFLL design.
+3. **Network Buffer Tuning**: Increase the lwIP UDP TX/RX buffers in `sdkconfig` and increase SCTP/DataChannel buffer sizes in `libpeer`. (Note: This only delays buffer-bloat and does not solve the CPU/network overhead bottleneck of unbatched frames).
+4. **Backpressure & Drop Policies**: Monitor the return code of `peer_connection_datachannel_send()`. If it returns `-1` (failure), intelligently drop frames at the sensor acquisition level rather than flooding the socket.

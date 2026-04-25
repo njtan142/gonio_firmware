@@ -11,5 +11,7 @@
   1 // set to 0 to disable WebRTC logs to save memory
 #define ENABLE_SYSTEM_LOG                                                      \
   1 // set to 0 to disable core system logs to save memory
-#define BATTERY_CAPACITY_MAH 450.0
-#define BATTERY_CAPACITY_MAS (BATTERY_CAPACITY_MAH * 3600.0)
+#define ENABLE_PC_DATA_TRACE 0 // set to 1 to enable low-level WebRTC data packet tracing
+#define ENABLE_PC_BIO_TRACE 0  // set to 1 to enable high-frequency BIO send/recv logs
+#define BATTERY_CAPACITY_MAH 450.0 // Nominal battery capacity in mAh
+#define BATTERY_CAPACITY_MAS (BATTERY_CAPACITY_MAH * 3600.0) // Capacity in mAs (milliampere-seconds)
