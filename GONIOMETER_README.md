@@ -10,7 +10,7 @@ This document describes what the system needs to implement based on the thesis
 | Repo | URL | Contents |
 |---|---|---|
 | Firmware | *(local, no remote)* | ESP32-C3 firmware — this repo (`ssd1306_test`) |
-| Web App | https://github.com/njtan142/goniometer-web-app | Single codebase built in two modes via ENV vars: 1) Local SPIFFS (ESP32 HTTP), 2) Vercel PWA (offline JSON playback) |
+| Web App | https://github.com/njtan142/goniometer-web-app — local: `C:\Users\njtan\Documents\GitHub\goniometer\web` | Single codebase built in two modes via ENV vars: 1) Local SPIFFS (ESP32 HTTP), 2) Vercel PWA (offline JSON playback) |
 
 ---
 
@@ -56,11 +56,10 @@ This document describes what the system needs to implement based on the thesis
 - SoC encoded as **8-bit value** (0–255 = 0–100%, resolution ≈ 0.4%)
 
 ### 2.5 Zero-Position Calibration
-- User triggers calibration via HTTP API while limb is in neutral anatomical pose
-- Firmware captures current raw sensor value as offset constant (`θ_offset`)
-- Corrected angle uses modulo arithmetic to handle 360°→0° wrap-around:
-  `θ_corrected = ((θ_raw - θ_offset) % 16384 + 16384) % 16384`
-- Then converts to degrees: `degrees = θ_corrected × (360.0 / 16384.0)`
+- Handled entirely client-side — firmware streams raw absolute angles (0–360°) unchanged
+- User clicks Set Zero in the UI while the limb is in the neutral anatomical pose
+- Browser accumulates a `zeroOffsets` map (joint → degrees) and subtracts it from every incoming reading before display
+- Offsets live in React state only; they reset on page reload (by design — no NVS or firmware involvement)
 
 ---
 
@@ -102,7 +101,7 @@ For a 4-sensor timestep, the ESP32 sends **4 × 8 = 32 bytes** sequentially.
 | `/` | GET | Serve `index.html` from SPIFFS |
 | `/*` | GET | Serve any static asset from SPIFFS (.js, .css, .gz) |
 | `/api/status` | GET | JSON: `{ soc, mode, rate, live }` |
-| `/api/zero` | POST | JSON body: `{ sensor: 0–3 }` — zero that sensor |
+| `/api/zero` | POST | No-op stub (calibration is client-side) |
 | `/api/start` | POST | JSON body: `{ frames_per_packet: 1–46, packet_freq_hz: 10–400 }` — begin streaming |
 | `/api/stop` | POST | Stop streaming, return to IDLE |
 
@@ -143,7 +142,7 @@ function parseFrame(view: DataView, offset: number) {
 | Live chart (rolling 29-point buffer) | Done — fed by WebRTC real data |
 | Normative range overlay + warnings | Done |
 | Hold / freeze stream | Done |
-| Set Zero (calibrate) | Done in JS; needs `POST /api/zero` call to firmware |
+| Set Zero (calibrate) | Done — client-side only; offset accumulated in `zeroOffsets` state and subtracted from incoming degrees |
 | Record / Stop | Done in JS; needs `POST /api/start` / `POST /api/stop` |
 | Export CSV | Done |
 | Battery % in sidebar | Done — real SoC decoded from WebRTC packet |
@@ -196,6 +195,7 @@ For upper-extremity: sensor 0 = Elbow, others configured per session.
 | Live chart | Rolling 29-point buffer, fed by WebRTC real data |
 | Normative range overlay + warnings | Done |
 | Hold / freeze stream | Done |
+| Set Zero (calibrate) | Done — client-side; `zeroOffsets` state subtracted from incoming degrees |
 | Export CSV | Done |
 | Battery % in sidebar | Real SoC decoded from WebRTC packet |
 | Live indicator | Reflects actual WebRTC data channel state |
@@ -208,7 +208,6 @@ For upper-extremity: sensor 0 = Elbow, others configured per session.
 **Web App**
 | Item | Blocking on |
 |---|---|
-| Set Zero button | JS UI done — needs `POST /api/zero` wired to firmware calibration |
 | Record / Stop | JS UI done — needs `POST /api/start` / `POST /api/stop` |
 
 ---
@@ -218,11 +217,11 @@ For upper-extremity: sensor 0 = Elbow, others configured per session.
 **Firmware**
 | Item | Notes |
 |---|---|
-| Zero-position calibration | `/api/zero` handler + per-sensor `θ_offset` in NVS; corrected angle formula in §2.5 |
 | TCP/WebSocket HFHL endpoint | `/ws` on port 80 — bulk-flush recording mode; no latency requirement but lossless |
 | Ring buffer | ~80 KB DRAM, ~2500 frames, drop-oldest, decouples sensor task from TCP/WebSocket flush (§2.2, §3.3) |
 | FSM | `IDLE` ↔ `ACTIVE_READINGS` state machine with sensor power gating (§2.3) |
-| Compiler optimization hardening | Race conditions in `webrtc.c` and `app_runtime.c` must be fixed first — see §7.4 |
+| Compiler optimization hardening | Race conditions in `webrtc.c` and `app_runtime.c` must be fixed first — see §7.5 |
+| UDP socket backpressure at 400 Hz | `ENOBUFS` bursts from `socket.c:128` at max rate; investigate lwIP/FreeRTOS tick resolution — see §7.4 |
 
 **Web App**
 | Item | Notes |
@@ -272,7 +271,31 @@ When `CONFIG_DATA_BUFFER_SIZE=0` was first applied, the browser received no data
 
 **Fix:** The `#else` branch in `peer_connection_datachannel_send_sid` (`peer_connection.c`) was updated to use `pc->sctp.data_sid` instead of the caller-supplied `sid`, making it consistent with the buffered path.
 
-### 7.4 Compiler Optimization — Not Yet Hardened
+### 7.4 UDP Socket Backpressure at Maximum Rate — To Investigate
+
+At `fpp=1, pkt_hz=400` (400 packets/s × 32 bytes = 12.8 KB/s) the following error appears in bursts from `socket.c:128`:
+
+```
+ERROR   ./components/libpeer/src/socket.c   128   Failed to sendto: Not enough space
+```
+
+`ENOBUFS` / "Not enough space" from `sendto` indicates the lwIP UDP send buffer is transiently full — the kernel-side socket TX queue is exhausted before the radio can drain it. The streaming stats show normal packet counts resume after each burst, so the connection does not drop; packets are silently discarded.
+
+**Observations:**
+- Only occurs at or near 400 Hz. Lower rates (≤200 Hz) appear clean.
+- Bursts of ~20–100 errors appear roughly every 2–8 seconds, then clear.
+- Total packet count still increments between error bursts, meaning the task keeps running.
+
+**Possible causes to investigate:**
+- lwIP UDP TX buffer size (`CONFIG_LWIP_UDP_RECVMBOX_SIZE` / socket send buffer) too small for sustained 400 Hz bursts.
+- `streaming_task` vTaskDelay tick resolution: at 400 Hz the delay is 2.5 ms; FreeRTOS tick rate (default 100 Hz = 10 ms) cannot resolve this, so the task fires in bursts rather than evenly, creating short-duration floods.
+- Wi-Fi driver TX queue (`CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM`) saturation on the ESP32-C3 radio side.
+
+**Workaround:** Keep `pkt_hz` ≤ 200 Hz for stable operation. Increasing `frames_per_packet` achieves the same total throughput with fewer UDP sends (e.g. fpp=2, pkt_hz=200 = same 400 readings/s, half the send rate).
+
+---
+
+### 7.5 Compiler Optimization — Not Yet Hardened
 
 Current build uses `-Og` (debug-friendly). The target is `-Os` (optimize for size), which would reclaim an estimated 100–200 KB of flash code space. The following race conditions exist in the codebase and are dormant under `-Og` but will manifest under `-Os` or `-O2`:
 

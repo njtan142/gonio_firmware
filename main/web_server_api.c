@@ -918,18 +918,17 @@ static esp_err_t api_stop_handler(httpd_req_t *req) {
 }
 
 /**
- * @brief Reserved endpoint for future firmware-side zero calibration persistence.
+ * @brief Reserved endpoint stub — zero-offset calibration is handled client-side.
  *
  * Endpoint: `POST /api/zero`
- * Currently a no-op as zero-offset calibration is handled in the browser.
+ * Zero offsets are pure display math applied in the browser; the firmware
+ * streams raw absolute angles and does not participate in calibration.
  *
  * @param req The HTTP request handle.
  * @return ESP_OK
  */
 static esp_err_t api_zero_handler(httpd_req_t *req) {
   set_cors_headers(req);
-  /* Zero-offset calibration is implemented on the browser side for now.
-   * This endpoint exists for future firmware-side offset storage. */
   send_json_ok(req);
   return ESP_OK;
 }
