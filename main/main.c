@@ -8,6 +8,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "ext_flash.h"
+#include "mt6701.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -53,6 +54,9 @@ void app_main(void) {
     // Network stack and signaling are only useful if static assets mounted.
     wifi_init_softap();
     web_server_start();
+    // SPI2 bus is live after ext_flash_init(); add MT6701 devices before
+    // streaming_task starts reading them inside webrtc_init().
+    mt6701_init();
     webrtc_init();
   }
 

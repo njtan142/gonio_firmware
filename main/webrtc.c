@@ -1,4 +1,5 @@
 #include "webrtc.h"
+#include "mt6701.h"
 #include "peer.h"
 #include "peer_connection.h"
 #include "app_config.h"
@@ -12,7 +13,6 @@
 #include "freertos/semphr.h"
 #include <string.h>
 #include <stdlib.h>
-#include <math.h>
 
 static const char *TAG = "webrtc";
 #define ENABLE_WEBRTC_TRACE 1
@@ -37,63 +37,28 @@ static uint32_t           g_tx_bytes      = 0;
 static uint32_t           g_rx_messages   = 0;
 
 /**
- * Mock sine-wave parameters matching JS app's ACTIVE_JOINTS order:
- * [0] left-elbow  [1] right-elbow  [2] left-knee  [3] right-knee
+ * @brief Packs one sensor reading into the 8-byte binary telemetry frame.
+ *
+ * Frame layout (big-endian, 64 bits):
+ *   [63:50] 14-bit angle  (0–16383 → 0–360°)
+ *   [49:18] 32-bit timestamp (µs, lower 32 bits — wraps ~71 min)
+ *   [17:10]  8-bit SoC    (0–255 → 0–100%)
+ *   [ 9: 6]  sensor 0–3 magnetic error flags  (bit 9 = sensor 0, …, bit 6 = sensor 3)
+ *   [ 5: 0]  reserved
+ *
+ * @param buf    8-byte output buffer.
+ * @param deg    Angle in degrees for this sensor slot.
+ * @param t_us   Hardware timestamp (esp_timer_get_time()).
+ * @param flags  10-bit status flags shared across the 4-sensor bundle.
  */
-static const float MOCK_CENTER[]    = { 80.0f,  75.0f,  90.0f,  85.0f };
-static const float MOCK_AMP[]       = { 40.0f,  38.0f,  45.0f,  42.0f };
-static const float MOCK_PERIOD_MS[] = { 8000.0f, 7500.0f, 10000.0f, 9500.0f };
-static const float MOCK_PHASE[]     = { 0.0f, 1.2f, 0.5f, 1.8f };
-
-/**
- * @brief Generates mock kinematic joint angles using a phase-shifted sine wave.
- *
- * Since physical encoders are not connected in this firmware iteration, we simulate 
- * joint angles to test the high-frequency WebRTC telemetry link and the browser's 3D visualizer.
- * Each "joint" runs on a slightly different period and phase to create organic-looking motion.
- *
- * @param s Sensor index (0=left-elbow, 1=right-elbow, 2=left-knee, 3=right-knee).
- * @param t_ms Current system uptime in milliseconds, used as the time domain 'x' input.
- * @return float Mock angle strictly clamped between 0.0 and 180.0 degrees to match physical servo limits.
- */
-static float mock_degrees(int s, int64_t t_ms) {
-    float deg = MOCK_CENTER[s] + MOCK_AMP[s] *
-                sinf(2.0f * (float)M_PI * (float)t_ms / MOCK_PERIOD_MS[s] + MOCK_PHASE[s]);
-    // Clamp to the range expected by the browser visualizer.
-    if (deg < 0.0f)   deg = 0.0f;
-    if (deg > 180.0f) deg = 180.0f;
-    return deg;
-}
-
-/**
- * @brief Packs a single kinematic sensor reading into a highly optimized 8-byte payload.
- *
- * To maximize telemetry throughput over the WebRTC Data Channel, we avoid heavy JSON payloads.
- * Instead, we use a custom 64-bit binary struct, packed tightly:
- *
- * [Bits 63:50] - 14-bit Angle (0-360 degrees mapped linearly to 0-16383).
- * [Bits 49:18] - 32-bit Timestamp (microseconds since boot, allows for precise browser-side jitter buffering).
- * [Bits 17:10] - 8-bit State of Charge (SoC % mapped to 0-255).
- * [Bits 9:0]   - 10-bit Flags (Reserved for future fault codes or calibration markers).
- *
- * The final 64-bit block is serialized in strict Network Byte Order (Big-Endian) so the browser's 
- * JavaScript DataView can parse it natively without endian-swapping overhead.
- *
- * @param[out] buf Pointer to an 8-byte buffer where the serialized data will be written.
- * @param s The joint index being sampled.
- * @param t_us The exact hardware microsecond timestamp of the sample.
- */
-static void pack_frame(uint8_t *buf, int s, int64_t t_us) {
-    float    deg   = mock_degrees(s, t_us / 1000);
-    // 14-bit angle field maps 0..360 deg onto 0..16383 raw units.
+static void pack_frame(uint8_t *buf, float deg, int64_t t_us, uint16_t flags) {
     uint16_t raw   = (uint16_t)(deg * (16384.0f / 360.0f)) & 0x3FFF;
-    // Only lower 32 bits are transmitted; receiver treats timestamp as wrapping.
     uint32_t ts    = (uint32_t)(t_us & 0xFFFFFFFFULL);
     uint8_t  soc   = (uint8_t)(g_soc_pct * 2.55f);
-    uint64_t frame = ((uint64_t)raw << 50)
-                   | ((uint64_t)ts  << 18)
-                   | ((uint64_t)soc << 10);
-    // Serialize as network-order bytes to keep browser-side unpacking simple.
+    uint64_t frame = ((uint64_t)raw          << 50)
+                   | ((uint64_t)ts           << 18)
+                   | ((uint64_t)soc          << 10)
+                   | ((uint64_t)(flags & 0x3FF));
     for (int i = 7; i >= 0; i--) {
         buf[i] = (uint8_t)(frame & 0xFF);
         frame >>= 8;
@@ -236,25 +201,54 @@ static void peer_main_task(void *pv) {
  * @param pv Task parameter (unused).
  */
 static void streaming_task(void *pv) {
+    // Fixed 32-byte payload: 4 sensors × 8 bytes each, filled each loop iteration.
     uint8_t payload[32];
     int64_t last_stat_log_us = 0;
-    while (1) {
-    // Back off when channel is down or user paused stream.
-    if (!g_dc_open || !g_stream_active) {
-      vTaskDelay(pdMS_TO_TICKS(100));
-      continue;
-    }
-    int64_t now = esp_timer_get_time();
-    // Packet payload is fixed at 4 sensors x 8 bytes each.
-    for (int s = 0; s < 4; s++) pack_frame(&payload[s * 8], s, now);
 
+    // This loop runs for the lifetime of the firmware — it is never explicitly
+    // exited. FreeRTOS tasks must not return; the scheduler owns the thread.
+    // "Stopping" the stream means falling into the idle backoff branch below
+    // (g_stream_active = false via webrtc_stop_stream(), or g_dc_open = false
+    // when the browser disconnects). The task keeps ticking at 10 Hz in that
+    // state, ready to resume the moment the channel comes back up.
+    while (1) {
+        // Back off when the WebRTC data channel is down or the user has paused
+        // the stream via /api/stop. Poll at 10 Hz so we resume quickly on reconnect.
+        if (!g_dc_open || !g_stream_active) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
+        // Snapshot the hardware timestamp once so all 4 sensor frames in this
+        // bundle share the exact same acquisition time.
+        int64_t now = esp_timer_get_time();
+
+        // Read all 4 MT6701 sensors first, then pack — this ensures the magnetic
+        // error flags (bits 9–6 of the status word) are consistent across the
+        // entire bundle rather than reflecting a mix of old and new error states.
+        float    deg[4];
+        uint16_t flags = 0;
+        for (int s = 0; s < 4; s++) {
+            deg[s] = mt6701_get_degrees(s);
+            // bit 9 = sensor 0 error, bit 8 = sensor 1, …, bit 6 = sensor 3.
+            if (mt6701_has_error(s)) flags |= (uint16_t)(1u << (9 - s));
+        }
+
+        // Serialise each sensor reading into its 8-byte slot in the payload buffer.
+        for (int s = 0; s < 4; s++) {
+            pack_frame(&payload[s * 8], deg[s], now, flags);
+        }
+
+        // Acquire the PeerConnection mutex and fire the send. Re-check g_dc_open
+        // under the lock because the channel can close between the guard above
+        // and here.
         xSemaphoreTake(g_pc_mutex, portMAX_DELAY);
         if (g_pc && g_dc_open) {
-        // Send exactly one sample bundle (4 sensors) each loop iteration.
-        int rc = peer_connection_datachannel_send(g_pc, (char *)payload, 32);
-        if (rc < 0) {
-          ESP_LOGW(TAG, "dc tx failed rc=%d", rc);
-        } else {
+            // Send exactly one 32-byte bundle (4 sensors) per iteration.
+            int rc = peer_connection_datachannel_send(g_pc, (char *)payload, 32);
+            if (rc < 0) {
+                ESP_LOGW(TAG, "dc tx failed rc=%d", rc);
+            } else {
                 g_tx_packets++;
                 g_tx_bytes += 32;
             }
@@ -262,6 +256,7 @@ static void streaming_task(void *pv) {
         xSemaphoreGive(g_pc_mutex);
 
 #if ENABLE_WEBRTC_TRACE
+        // Log throughput stats every 2 seconds so the UART isn't flooded.
         if (last_stat_log_us == 0 || (now - last_stat_log_us) >= 2000000) {
             ESP_LOGI(TAG, "dc tx packets=%lu bytes=%lu rate=%dHz active=%d",
                      (unsigned long)g_tx_packets, (unsigned long)g_tx_bytes,
@@ -270,9 +265,10 @@ static void streaming_task(void *pv) {
         }
 #endif
 
-    // g_stream_rate is clamped by webrtc_set_stream_rate().
-    vTaskDelay(pdMS_TO_TICKS(1000 / g_stream_rate));
-  }
+        // Sleep for exactly one sample period. g_stream_rate is clamped to
+        // 10–100 Hz by webrtc_set_stream_rate(), so the divisor is always safe.
+        vTaskDelay(pdMS_TO_TICKS(1000 / g_stream_rate));
+    }
 }
 
 /* ── helpers ────────────────────────────────────────────────────────────── */

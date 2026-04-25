@@ -170,12 +170,20 @@ For upper-extremity: sensor 0 = Elbow, others configured per session.
 - External SPI flash mounted as SPIFFS at `/spiffs`
 - INA219 coulomb counting + LiPo SoC estimation (already working)
 - SSD1306 display showing voltage, SoC%, mAh/s, SSID, IP
+- MT6701 SSI driver (`mt6701.c/h`):
+  - 4 sensors on SPI2 (shared with W25Q64), SPI Mode 3 (CPOL=1, CPHA=1)
+  - CS pins: GPIO 0 (Knee), GPIO 1 (Hip-yaw), GPIO 2 (Hip-pitch), GPIO 10 (Ankle-yaw)
+  - CRC-6 validation per frame (poly x⁶+x+1, confirmed against datasheet §6.8.2)
+  - Presence detection at boot — floating MISO (all-ones/all-zeros) rejected as false positives
+  - Sensor 0 (Knee/central) required; sensors 1–3 optional, absent slots output 0° silently
+  - Magnetic error flags encoded into telemetry status bits 9–6 per packet spec
+  - Real angle data replaces the JS mock sine-wave in the WebRTC streaming pipeline
 
 **Missing (firmware):**
-- MT6701 SSI driver
-- Ring buffer
+- Zero-position calibration (`/api/zero` endpoint + per-sensor `θ_offset` storage)
+- Ring buffer (decoupled high-rate acquisition from network flush)
 - WebSocket streaming endpoint (`/ws`)
-- HTTP API endpoints (`/api/zero`, `/api/start`, `/api/stop`, `/api/status`)
+- HTTP API endpoints (`/api/start`, `/api/stop`, `/api/status`)
 - UDP socket task
 
 **Missing (web app):**
