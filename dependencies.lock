@@ -13,38 +13,24 @@ dependencies:
     source:
       type: idf
     version: 5.5.2
-  sepfy/libpeer:
-    component_hash: 35a1f515f0cdd21473a00cfed56dc475f54be0046c54f4410c034906a708d772
-    dependencies:
-    - name: sepfy/srtp
-      registry_url: https://components.espressif.com
-      require: private
-      version: ^2.0.4
-    - name: sepfy/usrsctp
-      registry_url: https://components.espressif.com
-      require: private
-      version: ^0.9.5
-    source:
-      registry_url: https://components.espressif.com/
-      type: service
-    version: 0.0.3
   sepfy/srtp:
     component_hash: 5a75f043e29104975e3a0191e404a957a4d9088551842e16426a5b72e14610ae
     dependencies: []
     source:
-      registry_url: https://components.espressif.com
+      registry_url: https://components.espressif.com/
       type: service
     version: 2.3.0
   sepfy/usrsctp:
     component_hash: e96106dd3dbb4c1da7340a7cf044a2191bb28e706586fc20d25c08d75700583b
     dependencies: []
     source:
-      registry_url: https://components.espressif.com
+      registry_url: https://components.espressif.com/
       type: service
     version: 0.9.5
 direct_dependencies:
 - espressif/ssd1306
-- sepfy/libpeer
-manifest_hash: ca00c81b37b3026644621bf0d6f46b3b73b59cdc1441540b9e32c50cc51a6602
+- sepfy/srtp
+- sepfy/usrsctp
+manifest_hash: 7c3586ff391cf6fe73371aa2ae2e2c74029dd6221211e3f2a1c1868802774b22
 target: esp32c3
 version: 2.0.0

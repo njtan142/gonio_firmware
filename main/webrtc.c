@@ -116,6 +116,23 @@ static PeerConfiguration make_config(void) {
     return cfg;
 }
 
+// TODO (non-critical): Firefox compatibility.
+// The DTLS/SCTP handshake works reliably on Chrome but fails or stalls on
+// Firefox. Likely differences in DTLS flight timing, SCTP parameter
+// negotiation, or ICE candidate handling. Needs packet-level investigation
+// with Firefox's about:webrtc internals.
+
+// TODO (non-critical): Graceful browser close/refresh handling.
+// When the browser tab is closed or refreshed, the peer disappears without
+// sending a DTLS close_notify or SCTP ABORT. The streaming_task continues
+// to call peer_connection_datachannel_send(), which calls dtls_srtp_write(),
+// which calls agent_send() on a now-dead UDP path — flooding the log with
+// "Failed to sendto" errors. Fix options:
+//   1. Detect N consecutive send failures and auto-teardown the PeerConnection.
+//   2. Use CONFIG_KEEPALIVE_TIMEOUT (STUN binding request timeout) to detect
+//      the dead peer and transition to PEER_CONNECTION_CLOSED.
+//   3. Add a /api/disconnect endpoint for the browser's beforeunload event.
+
 /* ── libpeer callbacks ──────────────────────────────────────────────────── */
 
 /**
@@ -127,6 +144,7 @@ static PeerConfiguration make_config(void) {
 static void on_icestate(PeerConnectionState state, void *userdata) {
     ESP_LOGI(TAG, "ICE state: %s", peer_connection_state_to_string(state));
     // Any terminal/failed ICE state should stop telemetry transmission.
+    // NOTE: browser close/refresh does NOT trigger these states — see TODO above.
     if (state == PEER_CONNECTION_FAILED ||
         state == PEER_CONNECTION_DISCONNECTED ||
         state == PEER_CONNECTION_CLOSED) {
