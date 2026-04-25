@@ -886,10 +886,12 @@ static esp_err_t api_start_handler(httpd_req_t *req) {
   free(body);
 
   if (root) {
-    // Start endpoint is intentionally permissive: unknown fields are ignored.
-    cJSON *rate_item = cJSON_GetObjectItemCaseSensitive(root, "rate");
-    if (cJSON_IsNumber(rate_item)) {
-      webrtc_set_stream_rate((int)rate_item->valuedouble);
+    // Both fields must be present; a partial payload is silently ignored.
+    cJSON *fpp_item  = cJSON_GetObjectItemCaseSensitive(root, "frames_per_packet");
+    cJSON *freq_item = cJSON_GetObjectItemCaseSensitive(root, "packet_freq_hz");
+    if (cJSON_IsNumber(fpp_item) && cJSON_IsNumber(freq_item)) {
+      webrtc_set_batch_params((int)fpp_item->valuedouble,
+                              (int)freq_item->valuedouble);
     }
     cJSON_Delete(root);
   }

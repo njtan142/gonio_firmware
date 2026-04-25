@@ -281,10 +281,12 @@ int peer_connection_datachannel_send_sid(PeerConnection* pc, char* message, size
 #if (CONFIG_DATA_BUFFER_SIZE) > 0
   return buffer_push_tail(pc->data_rb, (uint8_t*)message, len);
 #else
+  // Use the negotiated data_sid, not the caller-supplied sid (which is always 0).
+  // The buffered path always used pc->sctp.data_sid; keep behaviour consistent.
   if (pc->config.datachannel == DATA_CHANNEL_STRING)
-    return sctp_outgoing_data(&pc->sctp, message, len, PPID_STRING, sid);
+    return sctp_outgoing_data(&pc->sctp, message, len, PPID_STRING, pc->sctp.data_sid);
   else
-    return sctp_outgoing_data(&pc->sctp, message, len, PPID_BINARY, sid);
+    return sctp_outgoing_data(&pc->sctp, message, len, PPID_BINARY, pc->sctp.data_sid);
 #endif
 }
 

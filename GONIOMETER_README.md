@@ -271,7 +271,7 @@ W (174488) webrtc: dc tx failed rc=-1
 **Recommended Approaches to Fix or Gracefully Handle:**
 1. **Implement Dynamic Payload Batching UI (Thesis Method)**: Update the Web App to utilize **two sliders**:
    - **Readings per Packet**: Increments of 4. Minimum of 1 (or 4 depending on active sensors). Maximum of 120.
-   - **Packet Transmission Frequency**: Minimum 10 Hz. Maximum 400 Hz (which assumes a 2.4ms max fill time). The maximum frequency slider must dynamically update based on the number of readings set per packet to avoid exceeding hardware limits. Default is 60 Hz.
+   - **Packet Transmission Frequency**: Minimum 10 Hz. Maximum 400 Hz (which assumes a 2.4ms max fill time of 122 readings times 20us per sensor reading). The maximum frequency slider must dynamically update based on the number of readings set per packet(if readings per packet is lower than 120 then max frequency should be higher) to avoid exceeding hardware limits. Default is 60 Hz.
    - The UI must calculate and display **Total Readings per Second** (`Readings per Packet` × `Packet Frequency`).
 2. **Backend Batching**: Update the backend `streaming_task` to accumulate readings into a large array (up to 120 frames) and send them as a single packet. This drastically reduces DTLS/SCTP encapsulation overhead and aligns with the LFLL design.
 3. **Network Buffer Tuning**: Increase the lwIP UDP TX/RX buffers in `sdkconfig` and increase SCTP/DataChannel buffer sizes in `libpeer`. (Note: This only delays buffer-bloat and does not solve the CPU/network overhead bottleneck of unbatched frames).

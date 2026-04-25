@@ -20,5 +20,5 @@ bool webrtc_is_connected(void);
 void webrtc_set_soc(float soc_pct);
 
 /* Called from /api/start and /api/stop handlers. */
-void webrtc_set_stream_rate(int rate_hz);
+void webrtc_set_batch_params(int frames_per_packet, int packet_freq_hz);
 void webrtc_stop_stream(void);

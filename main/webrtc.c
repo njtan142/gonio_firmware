@@ -27,8 +27,10 @@ static char              *g_answer_sdp    = NULL;
 // Data-channel liveness flag used by both /api/status and streaming loop.
 static volatile bool      g_dc_open       = false;
 // Last SoC value pushed from ui_task; encoded into outgoing telemetry frames.
-static volatile float     g_soc_pct       = 100.0f;
-static volatile int       g_stream_rate   = 50;   // Hz
+static volatile float     g_soc_pct            = 100.0f;
+// Batching parameters: fpp timesteps are packed into one DataChannel send.
+static volatile int       g_frames_per_packet  = 1;    // timesteps per send (1–46)
+static volatile int       g_packet_freq_hz     = 60;   // packet send rate (Hz, 10–400)
 // Send-loop gate toggled by control API and channel lifecycle callbacks.
 static volatile bool      g_stream_active = true;
 // Basic diagnostics counters for periodic trace logs.
@@ -201,73 +203,60 @@ static void peer_main_task(void *pv) {
  * @param pv Task parameter (unused).
  */
 static void streaming_task(void *pv) {
-    // Fixed 32-byte payload: 4 sensors × 8 bytes each, filled each loop iteration.
-    uint8_t payload[32];
+    // Static batch buffer: max 46 timesteps × 32 bytes = 1472 bytes (MTU).
+    // Static keeps it off the task stack, which is limited to 3 KB.
+    static uint8_t batch_buf[46 * 32];
     int64_t last_stat_log_us = 0;
 
-    // This loop runs for the lifetime of the firmware — it is never explicitly
-    // exited. FreeRTOS tasks must not return; the scheduler owns the thread.
-    // "Stopping" the stream means falling into the idle backoff branch below
-    // (g_stream_active = false via webrtc_stop_stream(), or g_dc_open = false
-    // when the browser disconnects). The task keeps ticking at 10 Hz in that
-    // state, ready to resume the moment the channel comes back up.
     while (1) {
-        // Back off when the WebRTC data channel is down or the user has paused
-        // the stream via /api/stop. Poll at 10 Hz so we resume quickly on reconnect.
         if (!g_dc_open || !g_stream_active) {
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
 
-        // Snapshot the hardware timestamp once so all 4 sensor frames in this
-        // bundle share the exact same acquisition time.
-        int64_t now = esp_timer_get_time();
+        // Snapshot both params atomically so the batch is self-consistent.
+        int fpp       = g_frames_per_packet;
+        int freq_hz   = g_packet_freq_hz;
+        int batch_len = fpp * 32;
 
-        // Read all 4 MT6701 sensors first, then pack — this ensures the magnetic
-        // error flags (bits 9–6 of the status word) are consistent across the
-        // entire bundle rather than reflecting a mix of old and new error states.
-        float    deg[4];
-        uint16_t flags = 0;
-        for (int s = 0; s < 4; s++) {
-            deg[s] = mt6701_get_degrees(s);
-            // bit 9 = sensor 0 error, bit 8 = sensor 1, …, bit 6 = sensor 3.
-            if (mt6701_has_error(s)) flags |= (uint16_t)(1u << (9 - s));
+        // Acquire fpp timesteps back-to-back; each gets its own hardware
+        // timestamp so the receiver can recover the real acquisition time.
+        for (int f = 0; f < fpp; f++) {
+            int64_t  now   = esp_timer_get_time();
+            float    deg[4];
+            uint16_t flags = 0;
+            for (int s = 0; s < 4; s++) {
+                deg[s] = mt6701_get_degrees(s);
+                if (mt6701_has_error(s)) flags |= (uint16_t)(1u << (9 - s));
+            }
+            for (int s = 0; s < 4; s++) {
+                pack_frame(&batch_buf[f * 32 + s * 8], deg[s], now, flags);
+            }
         }
 
-        // Serialise each sensor reading into its 8-byte slot in the payload buffer.
-        for (int s = 0; s < 4; s++) {
-            pack_frame(&payload[s * 8], deg[s], now, flags);
-        }
-
-        // Acquire the PeerConnection mutex and fire the send. Re-check g_dc_open
-        // under the lock because the channel can close between the guard above
-        // and here.
         xSemaphoreTake(g_pc_mutex, portMAX_DELAY);
         if (g_pc && g_dc_open) {
-            // Send exactly one 32-byte bundle (4 sensors) per iteration.
-            int rc = peer_connection_datachannel_send(g_pc, (char *)payload, 32);
+            int rc = peer_connection_datachannel_send(g_pc, (char *)batch_buf, batch_len);
             if (rc < 0) {
                 ESP_LOGW(TAG, "dc tx failed rc=%d", rc);
             } else {
                 g_tx_packets++;
-                g_tx_bytes += 32;
+                g_tx_bytes += batch_len;
             }
         }
         xSemaphoreGive(g_pc_mutex);
 
 #if ENABLE_WEBRTC_TRACE
-        // Log throughput stats every 2 seconds so the UART isn't flooded.
-        if (last_stat_log_us == 0 || (now - last_stat_log_us) >= 2000000) {
-            ESP_LOGI(TAG, "dc tx packets=%lu bytes=%lu rate=%dHz active=%d",
+        int64_t now_log = esp_timer_get_time();
+        if (last_stat_log_us == 0 || (now_log - last_stat_log_us) >= 2000000) {
+            ESP_LOGI(TAG, "dc tx pkts=%lu bytes=%lu fpp=%d pkt_hz=%d total_hz=%d active=%d",
                      (unsigned long)g_tx_packets, (unsigned long)g_tx_bytes,
-                     g_stream_rate, g_stream_active ? 1 : 0);
-            last_stat_log_us = now;
+                     fpp, freq_hz, fpp * freq_hz, g_stream_active ? 1 : 0);
+            last_stat_log_us = now_log;
         }
 #endif
 
-        // Sleep for exactly one sample period. g_stream_rate is clamped to
-        // 10–100 Hz by webrtc_set_stream_rate(), so the divisor is always safe.
-        vTaskDelay(pdMS_TO_TICKS(1000 / g_stream_rate));
+        vTaskDelay(pdMS_TO_TICKS(1000 / freq_hz));
     }
 }
 
@@ -430,19 +419,23 @@ void webrtc_set_soc(float soc_pct) {
 }
 
 /**
- * @brief Sets the streaming rate for the WebRTC data channel.
+ * @brief Sets the batching parameters for the WebRTC streaming task.
  *
- * @param rate_hz Streaming rate in Hertz (clamped between 10 and 100).
+ * @param frames_per_packet Timesteps to batch per DataChannel send (1–46).
+ *        46 is the MTU limit: 46 × 32 = 1472 bytes.
+ * @param packet_freq_hz    How often to send a batch packet (10–400 Hz).
+ *        Total readings/sec = frames_per_packet × packet_freq_hz.
  */
-void webrtc_set_stream_rate(int rate_hz) {
-  // Keep rate bounded to protect bandwidth and task scheduling jitter.
-  // Rate update is independent from stream_active (set by separate controls).
-  if (rate_hz >= 10 && rate_hz <= 100) {
-        g_stream_rate = rate_hz;
+void webrtc_set_batch_params(int frames_per_packet, int packet_freq_hz) {
+    if (frames_per_packet >= 1 && frames_per_packet <= 46)
+        g_frames_per_packet = frames_per_packet;
+    if (packet_freq_hz >= 10 && packet_freq_hz <= 400)
+        g_packet_freq_hz = packet_freq_hz;
 #if ENABLE_WEBRTC_TRACE
-        ESP_LOGI(TAG, "stream rate set to %dHz", g_stream_rate);
+    ESP_LOGI(TAG, "batch params: fpp=%d pkt_hz=%d -> total=%dHz",
+             g_frames_per_packet, g_packet_freq_hz,
+             g_frames_per_packet * g_packet_freq_hz);
 #endif
-    }
 }
 
 /**
