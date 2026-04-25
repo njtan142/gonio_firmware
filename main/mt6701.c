@@ -39,24 +39,45 @@ static float               s_last_deg[MT6701_NUM_SENSORS];
 static bool                s_present[MT6701_NUM_SENSORS];
 static bool                s_error[MT6701_NUM_SENSORS];
 
-// CRC-6 over the 18 data bits (raw >> 6), polynomial G(x) = x^6 + x + 1.
-// Datasheet §6.8.2: "CRC polynomials: X6+X+1, MSB stream in first."
-// The 6-bit feedback term (without the implicit leading x^6) is 0x03.
+/**
+ * @brief Computes a 6-bit CRC over 18 bits of sensor data.
+ *
+ * Uses polynomial G(x) = x^6 + x + 1 as specified in Datasheet §6.8.2.
+ * The 6-bit feedback term (excluding the implicit leading x^6) is 0x03.
+ *
+ * @param data18 The 18 data bits to compute the CRC for (raw >> 6).
+ * @return uint8_t The computed 6-bit CRC value.
+ */
 static uint8_t crc6_compute(uint32_t data18) {
     uint8_t crc = 0;
+    // Process each bit of the 18-bit data, starting from the Most Significant Bit (MSB).
     for (int i = 17; i >= 0; i--) {
+        // Extract the current input bit.
         uint8_t in = (data18 >> i) & 1;
+        // Extract the feedback bit, which is the MSB of the current 6-bit CRC (bit 5).
         uint8_t fb = (crc >> 5) & 1;
+        // Shift the CRC left by 1, dropping the old MSB and making room for the next bit.
+        // We mask with 0x3F to ensure the CRC remains strictly 6 bits.
         crc = (crc << 1) & 0x3F;
+        // If the input bit and feedback bit differ, we need to apply the polynomial.
         if (in ^ fb)
+            // XOR with 0x03 (binary 000011). This represents the x^1 and x^0 terms 
+            // of the polynomial G(x) = x^6 + x + 1. The x^6 term is implicit.
             crc ^= 0x03;
     }
     return crc;
 }
 
-// Returns true if at least one of MT6701_PROBE_TRIES reads returns a valid CRC.
-// A passing CRC proves the sensor is electrically responding; magnetic status
-// faults (weak/strong field) are a separate concern handled at runtime.
+/**
+ * @brief Probes a specific sensor to check for electrical presence.
+ *
+ * Attempts up to MT6701_PROBE_TRIES reads and looks for a valid CRC.
+ * A passing CRC proves the sensor is electrically responding; magnetic status
+ * faults (e.g., weak/strong field) are handled at runtime instead.
+ *
+ * @param i Sensor index to probe (0 to MT6701_NUM_SENSORS - 1).
+ * @return true if the sensor responds with a valid CRC, false otherwise.
+ */
 static bool probe_sensor(int i) {
     ESP_LOGI(TAG, "probing sensor %d (CS GPIO %d) ...", i, k_cs_pins[i]);
     for (int t = 0; t < MT6701_PROBE_TRIES; t++) {
@@ -70,10 +91,19 @@ static bool probe_sensor(int i) {
             ESP_LOGW(TAG, "  [%d/%d] SPI transmit failed", t + 1, MT6701_PROBE_TRIES);
             continue;
         }
+        // Assemble the 3 received bytes into a single 24-bit integer. (rx[0] is MSB, rx[2] is LSB)
         uint32_t raw      = ((uint32_t)rx[0] << 16) | ((uint32_t)rx[1] << 8) | rx[2];
+        
+        // Extract the 14-bit angle data (bits 23:10) by shifting right and applying the mask.
         uint16_t angle    = (raw >> ANGLE_SHIFT)  & ANGLE_MASK;
+        
+        // Extract the 4-bit magnetic status (bits 9:6) by shifting right and applying the mask.
         uint8_t  status   = (raw >> STATUS_SHIFT) & STATUS_MASK;
+        
+        // Extract the 6-bit received CRC (bits 5:0). No shift needed, just mask the lowest bits.
         uint8_t  crc_recv = raw & CRC_MASK;
+        
+        // Calculate the expected CRC using the upper 18 bits of the payload (angle + status).
         uint8_t  crc_calc = crc6_compute(raw >> STATUS_SHIFT);
         // 0xFFFFFF / 0x000000 are floating-bus signatures: MISO idles high or
         // low when no sensor is driving it, and all-ones/all-zeros happen to
@@ -82,9 +112,13 @@ static bool probe_sensor(int i) {
                           && (raw != 0xFFFFFF)
                           && (raw != 0x000000);
         ESP_LOGI(TAG, "  [%d/%d] raw=0x%06lx  angle=%u  status=0x%x  crc_recv=0x%02x  crc_calc=0x%02x  %s",
-                 t + 1, MT6701_PROBE_TRIES,
-                 (unsigned long)raw, angle, status,
-                 crc_recv, crc_calc,
+                 t + 1,
+                 MT6701_PROBE_TRIES,
+                 (unsigned long)raw,
+                 angle,
+                 status,
+                 crc_recv,
+                 crc_calc,
                  ok ? "PASS" : "FAIL");
         if (ok) return true;
     }
@@ -92,6 +126,15 @@ static bool probe_sensor(int i) {
     return false;
 }
 
+/**
+ * @brief Initializes the SPI bus and probes all MT6701 magnetic encoders.
+ *
+ * Configures the SPI interface for Mode 3 as required by the sensor to ensure
+ * stable sampling. Iterates through all possible sensor slots, probing each
+ * to establish presence and logging any missing sensors.
+ *
+ * @return ESP_OK on successful initialization.
+ */
 esp_err_t mt6701_init(void) {
     for (int i = 0; i < MT6701_NUM_SENSORS; i++) {
         spi_device_interface_config_t dev_cfg = {
@@ -112,6 +155,7 @@ esp_err_t mt6701_init(void) {
             return err;
         }
 
+        // Reset runtime state and probe if the sensor is electrically responding.
         s_last_deg[i] = 0.0f;
         s_error[i]    = false;
         s_present[i]  = probe_sensor(i);
@@ -133,6 +177,16 @@ esp_err_t mt6701_init(void) {
     return ESP_OK;
 }
 
+/**
+ * @brief Reads the current absolute angle from the specified sensor.
+ *
+ * Performs a 24-bit SPI read and decodes the angle, status, and CRC fields.
+ * If the sensor is absent, or if the CRC or magnetic status checks fail,
+ * it sets an error flag and returns the last known good angle.
+ *
+ * @param sensor The sensor index to read.
+ * @return float The current angle in degrees (0.0 to 360.0).
+ */
 float mt6701_get_degrees(int sensor) {
     if (sensor < 0 || sensor >= MT6701_NUM_SENSORS) return 0.0f;
 
@@ -147,17 +201,26 @@ float mt6701_get_degrees(int sensor) {
     };
 
     if (spi_device_transmit(s_devs[sensor], &t) != ESP_OK) {
+        // Set error flag and return the last known good position due to transmission failure.
         s_error[sensor] = true;
         return s_last_deg[sensor];
     }
 
+    // Assemble the 3 received bytes into a single 24-bit integer. (rx[0] is MSB, rx[2] is LSB)
     uint32_t raw    = ((uint32_t)rx[0] << 16) | ((uint32_t)rx[1] << 8) | rx[2];
+    
+    // Extract the 14-bit angle data (bits 23:10) by shifting right and applying the mask.
     uint16_t angle  = (raw >> ANGLE_SHIFT) & ANGLE_MASK;
+    
+    // Extract the 4-bit magnetic status (bits 9:6) by shifting right and applying the mask.
     uint8_t  status = (raw >> STATUS_SHIFT) & STATUS_MASK;
+    
+    // Extract the 6-bit received CRC (bits 5:0). No shift needed, just mask the lowest bits.
     uint8_t  crc    = raw & CRC_MASK;
 
     if (crc6_compute(raw >> STATUS_SHIFT) != crc) {
         ESP_LOGD(TAG, "sensor %d CRC fail raw=0x%06lx", sensor, (unsigned long)raw);
+        // Set error flag and return the last known good position due to data corruption.
         s_error[sensor] = true;
         return s_last_deg[sensor];
     }
@@ -167,11 +230,26 @@ float mt6701_get_degrees(int sensor) {
     return s_last_deg[sensor];
 }
 
+/**
+ * @brief Checks if a specific sensor was detected during initialization.
+ *
+ * @param sensor The sensor index to check.
+ * @return true if the sensor is present, false otherwise.
+ */
 bool mt6701_is_present(int sensor) {
     if (sensor < 0 || sensor >= MT6701_NUM_SENSORS) return false;
     return s_present[sensor];
 }
 
+/**
+ * @brief Checks if the specified sensor has encountered a recent read error.
+ *
+ * This includes SPI transmission failures, CRC mismatches, or magnetic field
+ * strength warnings reported by the sensor hardware.
+ *
+ * @param sensor The sensor index to check.
+ * @return true if an error has occurred, false otherwise.
+ */
 bool mt6701_has_error(int sensor) {
     if (sensor < 0 || sensor >= MT6701_NUM_SENSORS) return true;
     return s_error[sensor];

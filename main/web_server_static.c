@@ -138,26 +138,31 @@ static esp_err_t http_get_handler(httpd_req_t *req) {
   // We rely on req->uri exactly as received by HTTP server.
   const char *uri = req->uri;
 
+  // 1. Map the request URI to physical SPIFFS file paths.
+  // We generate both the standard path and a .gz variant to check for compressed assets.
   char filepath[600];
   char filepath_gz[604];
   build_spiffs_paths(uri, filepath, sizeof(filepath), filepath_gz,
                      sizeof(filepath_gz));
 
+  // 2. Attempt to open the asset. The loader prioritizes .gz files to save
+  // bandwidth and flash read time on the ESP32.
   bool is_gzip = false;
   FILE *f = open_static_asset(filepath, filepath_gz, &is_gzip);
   if (!f) {
-    // Not found in SPIFFS: return true HTTP 404.
+    // If the file is missing from the partition, return a standard 404.
     ESP_LOGW(TAG, "Not found: %s", filepath);
     httpd_resp_send_404(req);
     return ESP_FAIL;
   }
 
+  // 3. Set the appropriate Content-Type and add the GZIP encoding header if serving a compressed file.
   httpd_resp_set_type(req, guess_content_type(filepath));
   if (is_gzip)
-    // Only set when we opened "<path>.gz" successfully.
+    // Tells the browser to transparently decompress the incoming stream.
     httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
 
-  // Any streaming failure will be reflected via HTTP server internals/logs.
+  // 4. Stream the file content using chunked transfer encoding to keep memory usage low and constant.
   stream_file_chunks(req, f);
   fclose(f);
 

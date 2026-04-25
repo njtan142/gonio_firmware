@@ -2,6 +2,8 @@
 #include "ssd1306_util.h"
 #include "font8x8_basic.h"
 
+// Off-screen frame buffer where we draw before flushing to the physical display.
+// Each bit represents one pixel (128x64 / 8 bits = 1024 bytes).
 static uint8_t buffer[SSD1306_WIDTH * SSD1306_HEIGHT / 8];
 
 /**
@@ -12,13 +14,20 @@ static uint8_t buffer[SSD1306_WIDTH * SSD1306_HEIGHT / 8];
  * @return ESP_OK on success.
  */
 static esp_err_t ssd1306_write_byte(uint8_t reg, uint8_t data) {
-    // reg=0x00 for command stream, reg=0x40 for display RAM data stream.
+    // Create an I2C command link to queue up our multi-step transaction.
     i2c_cmd_handle_t cmd = i2c_cmd_link_create();
     i2c_master_start(cmd);
+    
+    // Write target address + write flag bit.
     i2c_master_write_byte(cmd, (SSD1306_I2C_ADDRESS << 1) | I2C_MASTER_WRITE, true);
+    
+    // Send the control byte (0x00 = command, 0x40 = data).
     i2c_master_write_byte(cmd, reg, true);
+    // Send the actual byte to be written.
     i2c_master_write_byte(cmd, data, true);
+    
     i2c_master_stop(cmd);
+    // Begin the I2C transmission with a 1-second timeout.
     esp_err_t ret = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(1000));
     i2c_cmd_link_delete(cmd);
     return ret;
@@ -43,6 +52,7 @@ void i2c_master_init(void) {
         .mode = I2C_MODE_MASTER,
         .sda_io_num = I2C_MASTER_SDA_IO,
         .scl_io_num = I2C_MASTER_SCL_IO,
+        // Enable internal pullups; usually required for I2C to idle HIGH.
         .sda_pullup_en = GPIO_PULLUP_ENABLE,
         .scl_pullup_en = GPIO_PULLUP_ENABLE,
         .master.clk_speed = I2C_MASTER_FREQ_HZ,
@@ -163,14 +173,22 @@ void ssd1306_draw_char(int x, int y, char c) {
 void ssd1306_set_text(int page, int col, char *text) {
     int x = col;
     int y = page * 8;
+    // Iterate through each character of the string until we hit the null terminator.
     while (*text) {
+        // Render the current ASCII character at the current (x, y) buffer coordinates.
         ssd1306_draw_char(x, y, *text);
+        
+        // Advance the X coordinate by 8 pixels (the fixed width of the 8x8 font).
         x += 8;
+        
+        // Check for right-side boundary overflow.
         if (x >= SSD1306_WIDTH) {
-            // Wrap to the next text page when reaching the right edge.
+            // Wrap the text to the next line: reset X to the left edge and move Y down by 8 pixels.
             x = 0;
             y += 8;
         }
+        
+        // Move to the next character in the source string.
         text++;
     }
 }
@@ -191,17 +209,25 @@ void ssd1306_display_text(int page, int col, char *text) {
  * @brief Flushes the internal buffer to the physical OLED display.
  */
 void ssd1306_update_display(void) {
+    // The SSD1306 memory is organized into 8 "pages," each representing a horizontal strip 8 pixels high.
     for (uint8_t i = 0; i < SSD1306_HEIGHT / 8; i++) {
-        ssd1306_command(0xB0 + i); // Set Page Start Address
+        // Set the target page address (0xB0 to 0xB7) where the next data will be written.
+        ssd1306_command(0xB0 + i); 
+        // Reset the column address to the start of the line (Column 0).
         ssd1306_command(0x00);     // Set Lower Column Start Address
         ssd1306_command(0x10);     // Set Higher Column Start Address
 
+        // Batch the pixel data for the entire 128-pixel row into a single I2C transaction.
         i2c_cmd_handle_t cmd = i2c_cmd_link_create();
         i2c_master_start(cmd);
         i2c_master_write_byte(cmd, (SSD1306_I2C_ADDRESS << 1) | I2C_MASTER_WRITE, true);
-        i2c_master_write_byte(cmd, 0x40, true); // Data mode
-        // Push one full page row (128 bytes) per transaction.
+        
+        // Use control byte 0x40 to indicate that following bytes should be written to Display RAM.
+        i2c_master_write_byte(cmd, 0x40, true); 
+        
+        // Stream 128 bytes from our internal buffer. Each byte represents a vertical column of 8 pixels.
         i2c_master_write(cmd, &buffer[SSD1306_WIDTH * i], SSD1306_WIDTH, true);
+        
         i2c_master_stop(cmd);
         i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, pdMS_TO_TICKS(1000));
         i2c_cmd_link_delete(cmd);

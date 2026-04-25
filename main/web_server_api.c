@@ -77,27 +77,35 @@ static bool get_client_ip(httpd_req_t *req, char *out, size_t out_len) {
   }
 
   if (addr.ss_family == AF_INET) {
-    // Common case: plain IPv4 peer socket.
+    // Case 1: Standard IPv4 connection. Extract the 32-bit address.
     struct sockaddr_in *in = (struct sockaddr_in *)&addr;
+    // Convert the binary network-byte-order address into a dotted-decimal string (e.g. "192.168.1.5").
     if (!inet_ntop(AF_INET, &in->sin_addr, out, out_len))
       return false;
     return true;
   }
 
   if (addr.ss_family == AF_INET6) {
-    // Handle IPv4-mapped IPv6 form (::ffff:a.b.c.d) emitted by some stacks.
+    // Case 2: IPv6 connection. We check for "IPv4-mapped IPv6" addresses (::ffff:a.b.c.d).
+    // This happens when an IPv4 client connects to a dual-stack listening socket.
     struct sockaddr_in6 *in6 = (struct sockaddr_in6 *)&addr;
     const uint8_t *a = in6->sin6_addr.s6_addr;
     bool mapped_v4 = true;
+    
+    // Check if the first 80 bits (10 bytes) are all zero.
     for (int i = 0; i < 10; i++) {
       if (a[i] != 0x00) {
         mapped_v4 = false;
         break;
       }
     }
+    
+    // Check if the next 16 bits are 0xffff, which confirms the mapping prefix.
     if (mapped_v4 && a[10] == 0xff && a[11] == 0xff) {
       struct in_addr v4;
+      // The actual IPv4 address is encapsulated in the final 4 bytes of the IPv6 address.
       memcpy(&v4, &a[12], sizeof(v4));
+      // Convert the encapsulated IPv4 address into its standard string representation.
       if (inet_ntop(AF_INET, &v4, out, out_len))
         return true;
     }
@@ -118,18 +126,22 @@ static bool get_client_ip(httpd_req_t *req, char *out, size_t out_len) {
  * @return true if an IP address was resolved, false otherwise.
  */
 static bool resolve_client_ip(httpd_req_t *req, char *out, size_t out_len) {
+  // 1. Primary Strategy: Extract the client IP directly from the active socket metadata.
   if (get_client_ip(req, out, out_len)) {
-    // Best case: request socket peer is available.
+    // This provides the most accurate "ground truth" for the current request.
     return true;
   }
 
+  // 2. Fallback Strategy: Use the latest IP address recorded by the Soft-AP DHCP handler.
+  // This is essential for AP mode where socket-level peer resolution can occasionally fail 
+  // during the rapid teardown/re-establishment of signaling connections.
   const char *last_sta_ip = web_server_get_last_sta_ip();
   if (last_sta_ip[0] != '\0') {
-    // Fallback from AP IP assignment event handler.
     snprintf(out, out_len, "%s", last_sta_ip);
     return true;
   }
 
+  // 3. Final Safety: If all resolution attempts fail, ensure the output buffer is a valid empty string.
   if (out_len > 0) {
     out[0] = '\0';
   }
