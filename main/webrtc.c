@@ -448,3 +448,23 @@ void webrtc_stop_stream(void) {
     ESP_LOGI(TAG, "stream stopped");
 #endif
 }
+
+void webrtc_teardown(void) {
+    g_stream_active = false;
+    g_dc_open       = false;
+
+    xSemaphoreTake(g_pc_mutex, portMAX_DELAY);
+    if (g_pc) {
+        peer_connection_close(g_pc);
+        peer_connection_destroy(g_pc);
+        g_pc = NULL;
+    }
+    xSemaphoreGive(g_pc_mutex);
+
+    free(g_answer_sdp);
+    g_answer_sdp = NULL;
+
+#if ENABLE_WEBRTC_TRACE
+    ESP_LOGI(TAG, "PeerConnection torn down — heap reclaimed");
+#endif
+}

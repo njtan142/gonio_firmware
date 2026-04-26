@@ -6,9 +6,10 @@
  * Acquisition auto-starts when a client connects and auto-stops on disconnect. */
 void hfhl_ws_init(httpd_handle_t server);
 
-/* Update the acquisition rate without changing run state.
- * Called from /api/start when slider params change. */
-void hfhl_ws_set_rate(int acq_hz);
+/* Update batching parameters without changing run state.
+ * Called from /api/start when slider params change.
+ * fpp = frames per batch, freq_hz = batch send frequency. */
+void hfhl_ws_set_batch_params(int fpp, int freq_hz);
 
 /* Force-stop acquisition regardless of client state.
  * Called from /api/stop. */

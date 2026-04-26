@@ -3,7 +3,7 @@
 #include <stdbool.h>
 
 #define RB_SAMPLE_SIZE  32     /* 4 sensors × 8 bytes per timestep */
-#define RB_CAPACITY      500   /* ~16 KB DRAM; burst absorber, not persistent store */
+#define RB_CAPACITY      2048  /* ~64 KB DRAM; burst absorber, not persistent store */
 
 /* Call once at startup — creates the mutex only, does NOT allocate the buffer. */
 void rb_init(void);

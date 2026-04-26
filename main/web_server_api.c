@@ -893,7 +893,7 @@ static esp_err_t api_start_handler(httpd_req_t *req) {
       int fpp  = (int)fpp_item->valuedouble;
       int freq = (int)freq_item->valuedouble;
       webrtc_set_batch_params(fpp, freq);
-      hfhl_ws_set_rate(fpp * freq);
+      hfhl_ws_set_batch_params(fpp, freq);
     }
     cJSON_Delete(root);
   }
@@ -914,6 +914,7 @@ static esp_err_t api_start_handler(httpd_req_t *req) {
 static esp_err_t api_stop_handler(httpd_req_t *req) {
   set_cors_headers(req);
   webrtc_stop_stream();
+  webrtc_teardown();
   hfhl_ws_stop();
   send_json_ok(req);
   return ESP_OK;

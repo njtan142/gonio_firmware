@@ -20,8 +20,9 @@ extern float soc_percent;
 
 static httpd_handle_t s_server    = NULL;
 static volatile int   s_client_fd = -1;
-static volatile bool  s_acq_run   = false;
-static volatile int   s_acq_hz    = 100;
+static volatile bool  s_acq_run      = false;
+static volatile int   s_acq_fpp      = 1;     /* frames per batch  (1–46) */
+static volatile int   s_acq_freq_hz  = 60;    /* batch frequency   (Hz)   */
 
 /* ── Frame packing ──────────────────────────────────────────────────────────
  * Same 8-byte big-endian layout as webrtc.c:
@@ -126,20 +127,47 @@ static void sensor_acq_task(void *pv) {
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
-        int64_t  now   = esp_timer_get_time();
-        float    deg[4];
-        uint16_t flags = 0;
-        for (int i = 0; i < 4; i++) {
-            deg[i] = mt6701_get_degrees(i);
-            if (mt6701_has_error(i)) flags |= (uint16_t)(1u << (9 - i));
+
+        /* Snapshot batch parameters atomically */
+        int fpp     = s_acq_fpp;
+        int freq_hz = s_acq_freq_hz;
+        int64_t batch_start_us = esp_timer_get_time();
+
+        /* Read fpp samples back-to-back in a tight loop — each gets its
+         * own hardware timestamp so the receiver can recover real timing. */
+        for (int f = 0; f < fpp; f++) {
+            int64_t  now   = esp_timer_get_time();
+            float    deg[4];
+            uint16_t flags = 0;
+            for (int i = 0; i < 4; i++) {
+                deg[i] = mt6701_get_degrees(i);
+                if (mt6701_has_error(i)) flags |= (uint16_t)(1u << (9 - i));
+            }
+            for (int i = 0; i < 4; i++) {
+                pack_frame(&sample[i * 8], deg[i], now, flags);
+            }
+            rb_push(sample);
         }
-        for (int i = 0; i < 4; i++) {
-            pack_frame(&sample[i * 8], deg[i], now, flags);
+
+        /* Wait for the next batch period.  The target interval may be
+         * shorter than one FreeRTOS tick (10 ms at 100 Hz tick rate),
+         * so we use esp_timer for sub-tick precision:
+         *   1. vTaskDelay handles the coarse wait (saves CPU)
+         *   2. busy-wait covers the final sub-tick remainder          */
+        int64_t batch_period_us = 1000000 / freq_hz;
+        int64_t elapsed_us     = esp_timer_get_time() - batch_start_us;
+        int64_t remaining_us   = batch_period_us - elapsed_us;
+
+        if (remaining_us > 2000) {
+            /* Coarse sleep — subtract 1 ms margin for busy-wait tail */
+            TickType_t ticks = pdMS_TO_TICKS((remaining_us - 1000) / 1000);
+            if (ticks > 0) vTaskDelay(ticks);
         }
-        rb_push(sample);
-        int hz = s_acq_hz;
-        TickType_t delay = pdMS_TO_TICKS(1000 / hz);
-        vTaskDelay(delay > 0 ? delay : 1);
+        /* Fine-grained busy-wait for the remainder */
+        while ((esp_timer_get_time() - batch_start_us) < batch_period_us) {
+            /* yield to equal-priority tasks while spinning */
+            taskYIELD();
+        }
     }
 }
 
@@ -202,9 +230,11 @@ void hfhl_ws_init(httpd_handle_t server) {
     ESP_LOGI(TAG, "HFHL WebSocket ready at ws://192.168.4.1/ws");
 }
 
-void hfhl_ws_set_rate(int acq_hz) {
-    if (acq_hz >= 1 && acq_hz <= 1000) s_acq_hz = acq_hz;
-    ESP_LOGI(TAG, "HFHL rate set to %d Hz", s_acq_hz);
+void hfhl_ws_set_batch_params(int fpp, int freq_hz) {
+    if (fpp >= 1 && fpp <= 46)       s_acq_fpp     = fpp;
+    if (freq_hz >= 1 && freq_hz <= 1000) s_acq_freq_hz = freq_hz;
+    ESP_LOGI(TAG, "HFHL batch params: fpp=%d freq=%dHz -> total=%dHz",
+             s_acq_fpp, s_acq_freq_hz, s_acq_fpp * s_acq_freq_hz);
 }
 
 void hfhl_ws_stop(void) {
