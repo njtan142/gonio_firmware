@@ -150,7 +150,7 @@ function parseFrame(view: DataView, offset: number) {
 | Sampling rate control | Done — two sliders: Frames/pkt (1–46) and Pkt freq (10–400 Hz); displays Total readings/s |
 | 3D avatar animation | Three.js model loaded; Play button is a no-op — needs bone rotation from live data |
 | History persistence | In-memory only; thesis strategy updated to JSON export (local app) → JSON import (PWA mirror) |
-| Mode selector (UDP/TCP) | Not in UI yet |
+| Mode selector (UDP/TCP) | Implicit — Record switches to WebSocket (HFHL), Stop returns to WebRTC (LFLL); no explicit toggle in UI |
 | PDF report generation | Thesis specifies jsPDF — not implemented |
 
 ---
@@ -187,6 +187,8 @@ For upper-extremity: sensor 0 = Elbow, others configured per session.
 | MT6701 SSI driver | 4 sensors on SPI2, Mode 3, CRC-6 (x⁶+x+1), boot presence probe, magnetic error flags in telemetry |
 | WebRTC streaming | LFLL live data channel; batched packets (1–46 timesteps × 32 bytes), 10–400 Hz send rate; verified responsive in browser |
 | Dynamic payload batching | `streaming_task` batches `frames_per_packet` timesteps per DataChannel send; `/api/start` accepts `{ frames_per_packet, packet_freq_hz }` |
+| TCP/WebSocket HFHL endpoint | `/ws` on port 80; `sensor_acq_task` (pri 6) + `ws_flush_task` (pri 4); auto-start on connect, auto-stop on disconnect; `/api/stop` tears down both paths |
+| Ring buffer | Heap-allocated on WS connect, freed on disconnect — 500 samples × 32 B = 16 KB; drop-oldest policy; mutex-protected push/pop; freed between sessions so WebRTC DTLS heap is available in live mode |
 
 **Web App**
 | Item | Notes |
@@ -200,15 +202,11 @@ For upper-extremity: sensor 0 = Elbow, others configured per session.
 | Battery % in sidebar | Real SoC decoded from WebRTC packet |
 | Live indicator | Reflects actual WebRTC data channel state |
 | Sampling rate UI | Two sliders: Frames/pkt (1–46) and Pkt freq (10–400 Hz); displays Total readings/s |
+| WebSocket client + binary parser | `WSClient` in `src/lib/ws.ts`; shares `parsePacket` with WebRTC path; dispatches per-timestep `onPacket` callbacks |
+| Record / Stop | Record switches to WebSocket mode (calls `/api/stop` first, 600 ms delay, then connects `ws://192.168.4.1/ws`); Stop disconnects WebSocket and returns to WebRTC live mode |
+| Mode switching | Automatic — driven by Record/Stop; WebRTC and WebSocket are mutually exclusive via mode-gated `useEffect` hooks |
 
 ---
-
-### 🔧 In Progress
-
-**Web App**
-| Item | Blocking on |
-|---|---|
-| Record / Stop | JS UI done — needs `POST /api/start` / `POST /api/stop` |
 
 ---
 
@@ -217,8 +215,6 @@ For upper-extremity: sensor 0 = Elbow, others configured per session.
 **Firmware**
 | Item | Notes |
 |---|---|
-| TCP/WebSocket HFHL endpoint | `/ws` on port 80 — bulk-flush recording mode; no latency requirement but lossless |
-| Ring buffer | ~80 KB DRAM, ~2500 frames, drop-oldest, decouples sensor task from TCP/WebSocket flush (§2.2, §3.3) |
 | FSM | `IDLE` ↔ `ACTIVE_READINGS` state machine with sensor power gating (§2.3) |
 | Compiler optimization hardening | Race conditions in `webrtc.c` and `app_runtime.c` must be fixed first — see §7.5 |
 | UDP socket backpressure at 400 Hz | `ENOBUFS` bursts from `socket.c:128` at max rate; investigate lwIP/FreeRTOS tick resolution — see §7.4 |
@@ -226,8 +222,6 @@ For upper-extremity: sensor 0 = Elbow, others configured per session.
 **Web App**
 | Item | Notes |
 |---|---|
-| WebSocket connection + binary parser | Required for HFHL recording mode (`ws://192.168.4.1/ws`) |
-| Mode selector UI | UDP / TCP toggle before starting a session |
 | 3D avatar animation | Three.js bone rotation from live angle data; Play button currently no-op |
 | Offline History (JSON Export/Import) | Requires JSON export button on ESP32 web app, and JSON import on PWA mirror |
 | PDF report generation | Not started; thesis specifies jsPDF |
@@ -295,7 +289,24 @@ ERROR   ./components/libpeer/src/socket.c   128   Failed to sendto: Not enough s
 
 ---
 
-### 7.5 Compiler Optimization — Not Yet Hardened
+### 7.5 Ring Buffer Heap Conflict with WebRTC DTLS — Fixed
+
+The original ring buffer used a static array (`static uint8_t s_buf[2500][32]` = 80 KB in `.bss`). This permanently reduced available heap at boot, leaving insufficient memory for mbedTLS to allocate the DTLS SSL context when WebRTC attempted a peer connection:
+
+```
+ERROR ./components/libpeer/src/dtls_srtp.c  234  mbedtls_ssl_setup failed -0x7f00
+ERROR ./components/libpeer/src/peer_connection.c  355  dtls_srtp_init failed -0x7f00
+```
+
+`-0x7f00` is `MBEDTLS_ERR_SSL_ALLOC_FAILED` — the mbedTLS heap allocator returned NULL.
+
+**Fix:** The ring buffer is now heap-allocated (`malloc`) only when a WebSocket client connects (`rb_alloc()`), and freed (`rb_free()`) when it disconnects. Capacity was reduced from 2500 to 500 samples (80 KB → 16 KB) — sufficient burst absorption while leaving ample heap for the DTLS context in live mode.
+
+**Browser-side coordination:** When Record is pressed, the web app calls `POST /api/stop` (firmware tears down WebRTC stream), then waits 600 ms before opening the WebSocket. This gap ensures libpeer has finished freeing its DTLS/SRTP heap before `rb_alloc()` is called. When Stop is pressed, the WebSocket closes and `rb_free()` is called immediately, restoring the heap for the next WebRTC session.
+
+---
+
+### 7.6 Compiler Optimization — Not Yet Hardened
 
 Current build uses `-Og` (debug-friendly). The target is `-Os` (optimize for size), which would reclaim an estimated 100–200 KB of flash code space. The following race conditions exist in the codebase and are dormant under `-Og` but will manifest under `-Os` or `-O2`:
 
