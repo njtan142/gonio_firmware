@@ -222,6 +222,8 @@ For upper-extremity: sensor 0 = Elbow, others configured per session.
 **Web App**
 | Item | Notes |
 |---|---|
+| Chart X-axis: degrees vs time | Current rolling chart uses frame index as X-axis; should use real elapsed time (ms or s) derived from the µs timestamp in each packet so the axis reflects actual sampling rate and gaps |
+| History playback view | Clicking a history entry should load its recorded data into the chart; the top control panel should be replaced with playback/debugging controls (play, pause, scrub, speed, export) appropriate for reviewing a completed session |
 | 3D avatar animation | Three.js bone rotation from live angle data; Play button currently no-op |
 | Offline History (JSON Export/Import) | Requires JSON export button on ESP32 web app, and JSON import on PWA mirror |
 | PDF report generation | Not started; thesis specifies jsPDF |
