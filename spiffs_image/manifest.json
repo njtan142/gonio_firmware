@@ -1,8 +1,8 @@
 {
-  "timestamp": "2026-04-26T12:52:20.915Z",
-  "totalFiles": 11,
-  "originalSize": 4189576,
-  "compressedSize": 1441471,
+  "timestamp": "2026-04-26T17:29:23.729Z",
+  "totalFiles": 12,
+  "originalSize": 4198302,
+  "compressedSize": 1443805,
   "compressionRatio": "65.6%",
   "files": [
     {
@@ -34,24 +34,17 @@
       "gzipped": true
     },
     {
-      "path": "/c/BXnnfgdS.js",
+      "path": "/c/C5tLakSL.js",
       "mimeType": "text/javascript",
-      "originalSize": 777,
-      "compressedSize": 440,
+      "originalSize": 8832,
+      "compressedSize": 4040,
       "gzipped": true
     },
     {
-      "path": "/c/C4dtO0rR.js",
+      "path": "/c/CNjDTi1r.js",
       "mimeType": "text/javascript",
-      "originalSize": 8810,
-      "compressedSize": 4028,
-      "gzipped": true
-    },
-    {
-      "path": "/c/CZueGI6g.js",
-      "mimeType": "text/javascript",
-      "originalSize": 156310,
-      "compressedSize": 51011,
+      "originalSize": 591536,
+      "compressedSize": 146625,
       "gzipped": true
     },
     {
@@ -62,17 +55,31 @@
       "gzipped": true
     },
     {
-      "path": "/DFZ0D3Sd.js",
+      "path": "/c/DBtHatna.js",
       "mimeType": "text/javascript",
-      "originalSize": 1070593,
-      "compressedSize": 302207,
+      "originalSize": 156332,
+      "compressedSize": 51020,
+      "gzipped": true
+    },
+    {
+      "path": "/CZbrkfaN.js",
+      "mimeType": "text/javascript",
+      "originalSize": 823,
+      "compressedSize": 471,
+      "gzipped": true
+    },
+    {
+      "path": "/Dy5Oafbr.js",
+      "mimeType": "text/javascript",
+      "originalSize": 487636,
+      "compressedSize": 157845,
       "gzipped": true
     },
     {
       "path": "/index.html",
       "mimeType": "text/html",
-      "originalSize": 38019,
-      "compressedSize": 4931,
+      "originalSize": 38076,
+      "compressedSize": 4950,
       "gzipped": true
     },
     {
