@@ -2,6 +2,7 @@
 #include "web_server_api.h"
 #include "web_server_state.h"
 #include "web_server_static.h"
+#include "hfhl_ws.h"
 #include "esp_event.h"
 #include "esp_http_server.h"
 #include "app_config.h"
@@ -157,6 +158,8 @@ void web_server_start(void) {
 
   // API endpoints are registered first so they are not shadowed by 404 fallback.
   web_server_register_api_routes(server);
+  // HFHL WebSocket endpoint must be registered before the static wildcard handler.
+  hfhl_ws_init(server);
   web_server_register_static_handlers(server);
 
   ESP_LOGI(TAG, "HTTP server started on port 80");

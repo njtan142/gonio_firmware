@@ -9,6 +9,7 @@
 #endif
 #include "esp_log.h"
 #include "webrtc.h"
+#include "hfhl_ws.h"
 #include <arpa/inet.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -886,12 +887,13 @@ static esp_err_t api_start_handler(httpd_req_t *req) {
   free(body);
 
   if (root) {
-    // Both fields must be present; a partial payload is silently ignored.
     cJSON *fpp_item  = cJSON_GetObjectItemCaseSensitive(root, "frames_per_packet");
     cJSON *freq_item = cJSON_GetObjectItemCaseSensitive(root, "packet_freq_hz");
     if (cJSON_IsNumber(fpp_item) && cJSON_IsNumber(freq_item)) {
-      webrtc_set_batch_params((int)fpp_item->valuedouble,
-                              (int)freq_item->valuedouble);
+      int fpp  = (int)fpp_item->valuedouble;
+      int freq = (int)freq_item->valuedouble;
+      webrtc_set_batch_params(fpp, freq);
+      hfhl_ws_set_rate(fpp * freq);
     }
     cJSON_Delete(root);
   }
@@ -911,8 +913,8 @@ static esp_err_t api_start_handler(httpd_req_t *req) {
  */
 static esp_err_t api_stop_handler(httpd_req_t *req) {
   set_cors_headers(req);
-  // Idempotent stop is safe even if stream is already inactive.
   webrtc_stop_stream();
+  hfhl_ws_stop();
   send_json_ok(req);
   return ESP_OK;
 }
