@@ -205,6 +205,12 @@ For upper-extremity: sensor 0 = Elbow, others configured per session.
 | WebSocket client + binary parser | `WSClient` in `src/lib/ws.ts`; shares `parsePacket` with WebRTC path; dispatches per-timestep `onPacket` callbacks |
 | Record / Stop | Record switches to WebSocket mode (calls `/api/stop` first, 600 ms delay, then connects `ws://192.168.4.1/ws`); Stop disconnects WebSocket and returns to WebRTC live mode |
 | Mode switching | Automatic — driven by Record/Stop; WebRTC and WebSocket are mutually exclusive via mode-gated `useEffect` hooks |
+| Chart X-axis: elapsed time | `chartTimestamps[]` (firmware µs) fed alongside angles; `ChartVisualization` shows 8 evenly-spaced time labels (ms/s) derived from `ts[i] − ts[0]`; falls back to frame index while buffer fills |
+| History playback view | Clicking a history entry (with `rawData`) enters playback mode; `PlaybackPanel` replaces `ControlPanelTop` with scrub slider, play/pause, speed (0.25×–4×), CSV export, and exit; chart and gauge reflect current playback frame |
+| 3D avatar bone animation | `AnimateModal` accepts `liveAngle` prop; `liveAngleRef` updated each render; Three.js animation loop applies `rotation.x = rad` to target bone every frame without re-triggering scene setup |
+| JSON export | `handleExportJSON` in App.tsx — exports `{ metadata, frames[] }` JSON with relative timestamps; `CSV` + `JSON` + `Import` + `PDF` buttons in `ControlPanelTop` |
+| JSON import | `handleImportJSON` — file picker accepts `.json`, validates format, reconstructs `HistorySession` with `rawData` and adds to history; Import button also in sidebar history header |
+| PDF report generation | `handleGeneratePDF` using jsPDF v4; reports per-joint min/max/ROM/mean for current recording or active playback session |
 
 ---
 
@@ -222,11 +228,6 @@ For upper-extremity: sensor 0 = Elbow, others configured per session.
 **Web App**
 | Item | Notes |
 |---|---|
-| Chart X-axis: degrees vs time | Current rolling chart uses frame index as X-axis; should use real elapsed time (ms or s) derived from the µs timestamp in each packet so the axis reflects actual sampling rate and gaps |
-| History playback view | Clicking a history entry should load its recorded data into the chart; the top control panel should be replaced with playback/debugging controls (play, pause, scrub, speed, export) appropriate for reviewing a completed session |
-| 3D avatar animation | Three.js bone rotation from live angle data; Play button currently no-op |
-| Offline History (JSON Export/Import) | Requires JSON export button on ESP32 web app, and JSON import on PWA mirror |
-| PDF report generation | Not started; thesis specifies jsPDF |
 | WebRTC Latency Monitor | Real-time RTT/ping display in UI using `getStats()` API |
 
 ---
