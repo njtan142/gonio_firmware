@@ -224,6 +224,7 @@ For upper-extremity: sensor 0 = Elbow, others configured per session.
 | FSM | `IDLE` ↔ `ACTIVE_READINGS` state machine with sensor power gating (§2.3) |
 | Compiler optimization hardening | Race conditions in `webrtc.c` and `app_runtime.c` must be fixed first — see §7.5 |
 | UDP socket backpressure at 400 Hz | `ENOBUFS` bursts from `socket.c:128` at max rate; investigate lwIP/FreeRTOS tick resolution — see §7.4 |
+| HFHL delta wire-format compression | Implement v2 batch format (5.3× ratio, lifts 10 kHz rate cap) — see §7.7 |
 
 **Web App**
 | Item | Notes |
@@ -323,3 +324,46 @@ Current build uses `-Og` (debug-friendly). The target is `-Os` (optimize for siz
 - `app_runtime.c:61,73` — `last_ts == 0` used as first-run sentinel. Under aggressive optimization the compiler may hoist or reorder this check. Fix: use a dedicated `bool first_sample` flag instead.
 
 Once all fixes are applied, switch via `idf.py menuconfig` → *Compiler options* → *Optimization Level* → **Optimize for size**, which sets `CONFIG_COMPILER_OPTIMIZATION_SIZE=y` in `sdkconfig`.
+
+---
+
+### 7.7 HFHL Wire-Format Compression — Planned
+
+**Problem:** At 18,400 Hz the raw wire format (32 bytes/sample) demands 589 KB/s, exceeding the ESP32-C3 soft-AP TCP ceiling of ~400 KB/s. Short-term fix (live in `hfhl_ws.c`): acquisition rate is capped to `HFHL_MAX_SAMPLE_HZ = 10,000` (320 KB/s) when `hfhl_ws_set_batch_params` is called, preventing ring buffer stalls. Remove this cap once delta compression is implemented.
+
+**Root cause of wire-format inefficiency:** Each 32-byte sample duplicates the shared timestamp, SoC, and flags across all 4 sensor sub-frames — 18 bytes wasted per sample:
+
+```
+Current:  4 × [14-bit angle | 32-bit ts | 8-bit SoC | 10-bit flags] = 32 bytes/sample
+          Timestamp, SoC, and flags are identical for all 4 sensors — repeated 3 extra times.
+```
+
+**Planned v2 batch wire format:**
+
+```
+Batch header (18 bytes, once per WebSocket frame):
+  [0]      version = 2
+  [1–2]    uint16_t sample_count (LE)
+  [3–6]    uint32_t base_timestamp_us (LE)
+  [7–14]   4 × uint16_t base_angles[4]  (14-bit value in LE uint16, upper 2 bits reserved)
+  [15]     uint8_t soc
+  [16–17]  uint16_t flags (LE)
+
+Per subsequent sample (6 bytes):
+  [0–3]    4 × int8_t delta_angle[4]   (signed raw-count delta from previous sample)
+  [4–5]    uint16_t delta_ts_us        (unsigned µs delta from previous sample, LE)
+```
+
+**Why int8_t is safe for angle deltas:** At 18,400 Hz, a joint rotating at 720°/sec produces 0.039°/sample = 0.72 raw counts. An `int8_t` covers ±127 counts = ±2.79°/sample = ±51,300°/sec — physically impossible for biological joints. Wrap-around (0 ↔ 16383) is handled by checking `|delta| > 8192` and adjusting by ±16384 before clamping.
+
+**Compression ratio:**
+
+```
+Original:    512 samples × 32 bytes  = 16,384 bytes
+v2:          18 (header) + 511 × 6   =  3,084 bytes  →  5.3× ratio
+At 18,400 Hz: 18,400 samples/s × 6 bytes = 110 KB/s  (well under 400 KB/s TCP ceiling)
+```
+
+**Files to change when implementing:**
+- `main/hfhl_ws.c` — add `compress_batch()` called in `ws_flush_task` between `rb_pop_batch` and `httpd_queue_work`; add a static `s_compress_buf[4096]` (≥ 3,084 bytes max); remove `HFHL_MAX_SAMPLE_HZ` cap
+- Web app `src/lib/ws.ts` — replace v1 `parsePacket` with a v2 decoder that reconstructs absolute angles and timestamps from the batch header + cumulative deltas

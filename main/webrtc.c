@@ -256,7 +256,10 @@ static void streaming_task(void *pv) {
         }
 #endif
 
-        vTaskDelay(pdMS_TO_TICKS(1000 / freq_hz));
+        /* Minimum 1 tick so peer_main_task (same priority) and lower-priority
+         * tasks get CPU time; prevents UDP socket buffer exhaustion. */
+        TickType_t delay = pdMS_TO_TICKS(1000 / freq_hz);
+        vTaskDelay(delay > 0 ? delay : 1);
     }
 }
 

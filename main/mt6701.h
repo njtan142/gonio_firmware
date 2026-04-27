@@ -33,3 +33,8 @@ bool mt6701_is_present(int sensor);
 // True when the most recent read had a CRC fault or weak/strong-field warning,
 // or the sensor was never detected.
 bool mt6701_has_error(int sensor);
+
+// Acquire/release the SPI bus for bulk reads — avoids per-transaction bus
+// arbitration overhead inside tight acquisition loops.
+void mt6701_acquire_bus(void);
+void mt6701_release_bus(void);

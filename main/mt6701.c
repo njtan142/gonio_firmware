@@ -6,7 +6,7 @@
 // ext_flash.c initialises the bus (GPIO 4=CLK, 5=MISO, 6=MOSI); each sensor
 // gets its own CS. The SPI master driver arbitrates bus access per device.
 #define MT6701_SPI_HOST    SPI2_HOST
-#define MT6701_FREQ_HZ     (1 * 1000 * 1000)  // 1 MHz — conservative for SSI on jumper wires
+#define MT6701_FREQ_HZ     (4 * 1000 * 1000)  // 4 MHz — MT6701 supports up to ~15 MHz
 #define MT6701_PROBE_TRIES 5                   // reads used at boot to decide if a sensor is wired
 
 // SSI frame bit layout (24 bits, MSB first):
@@ -200,7 +200,7 @@ float mt6701_get_degrees(int sensor) {
         .rx_buffer = rx,
     };
 
-    if (spi_device_transmit(s_devs[sensor], &t) != ESP_OK) {
+    if (spi_device_polling_transmit(s_devs[sensor], &t) != ESP_OK) {
         // Set error flag and return the last known good position due to transmission failure.
         s_error[sensor] = true;
         return s_last_deg[sensor];
@@ -253,4 +253,14 @@ bool mt6701_is_present(int sensor) {
 bool mt6701_has_error(int sensor) {
     if (sensor < 0 || sensor >= MT6701_NUM_SENSORS) return true;
     return s_error[sensor];
+}
+
+void mt6701_acquire_bus(void) {
+    /* Acquire via sensor 0's handle — all sensors share the same SPI bus,
+     * so holding it through one device blocks the others' bus arbitration. */
+    spi_device_acquire_bus(s_devs[0], portMAX_DELAY);
+}
+
+void mt6701_release_bus(void) {
+    spi_device_release_bus(s_devs[0]);
 }
