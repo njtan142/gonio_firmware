@@ -34,7 +34,19 @@ bool mt6701_is_present(int sensor);
 // or the sensor was never detected.
 bool mt6701_has_error(int sensor);
 
-// Acquire/release the SPI bus for bulk reads — avoids per-transaction bus
-// arbitration overhead inside tight acquisition loops.
+// Acquire/release the SPI bus for bulk reads.
+// mt6701_acquire_bus() primes the SPI2 peripheral with one driver-based read
+// per present sensor and snapshots each sensor's GPSPI2.misc config so that
+// mt6701_get_degrees_fast() can switch hardware CS between sensors with a
+// single register write — no spi_hal_setup_device() call per read.
 void mt6701_acquire_bus(void);
 void mt6701_release_bus(void);
+
+// Direct-register SSI read — bypasses the ESP-IDF SPI master driver.
+// ~7 µs per call vs ~48 µs for mt6701_get_degrees().
+// Only valid while the bus is held via mt6701_acquire_bus(); will fall back
+// to the driver path (with a one-shot error log) if called unarmed.
+// ESP32-C3 specific: uses GPSPI2 hardware with hardware-managed CS.
+// All four sensors are supported — CS routing is restored from the per-sensor
+// snapshot captured during acquire_bus().
+float mt6701_get_degrees_fast(int sensor);

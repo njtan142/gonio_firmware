@@ -4,9 +4,9 @@
 #include <string.h>
 #include <stdlib.h>
 
-/* Static BSS allocation — sized at link time, no heap fragmentation risk.
- * 512 × 32 B = 16 KB, which coexists with the WebRTC DTLS heap (§7.5). */
-static uint8_t           s_buf[RB_CAPACITY * RB_SAMPLE_SIZE];
+/* Heap-allocated on WS connect, freed on WS disconnect — keeps the DTLS heap
+ * available during WebRTC sessions (§7.5). NULL when no WS client is active. */
+static uint8_t          *s_buf   = NULL;
 static int               s_head  = 0;
 static int               s_tail  = 0;
 static int               s_count = 0;
@@ -17,23 +17,29 @@ void rb_init(void) {
     if (!s_mutex) s_mutex = xSemaphoreCreateMutex();
 }
 
-/* rb_alloc / rb_free kept for call-site compatibility — buffer is always
- * present in BSS so alloc is a no-op and free just resets state. */
 bool rb_alloc(void) {
-    rb_reset();
+    if (s_buf) { rb_reset(); return true; }  /* idempotent */
+    s_buf = malloc((size_t)RB_CAPACITY * RB_SAMPLE_SIZE);
+    if (!s_buf) return false;
+    s_head = s_tail = s_count = s_drops = 0;
     return true;
 }
 
 void rb_free(void) {
-    rb_reset();
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    free(s_buf);
+    s_buf   = NULL;
+    s_head  = 0;
+    s_tail  = 0;
+    s_count = 0;
+    s_drops = 0;
+    xSemaphoreGive(s_mutex);
 }
 
 void rb_push(const uint8_t *sample) {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    if (s_count >= RB_CAPACITY) {
-        /* drop-newest: buffer full — discard incoming sample to protect
-         * data already queued and waiting to be sent (HFHL semantics). */
-        s_drops++;
+    if (!s_buf || s_count >= RB_CAPACITY) {
+        if (s_buf) s_drops++;
         xSemaphoreGive(s_mutex);
         return;
     }
@@ -45,6 +51,7 @@ void rb_push(const uint8_t *sample) {
 
 int rb_pop_batch(uint8_t *dst, int max) {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (!s_buf) { xSemaphoreGive(s_mutex); return 0; }
     int n = (s_count < max) ? s_count : max;
     for (int i = 0; i < n; i++) {
         memcpy(dst + (size_t)i * RB_SAMPLE_SIZE,

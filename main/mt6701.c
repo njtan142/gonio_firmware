@@ -1,6 +1,8 @@
 #include "mt6701.h"
 #include "driver/spi_master.h"
 #include "esp_log.h"
+#include "esp_timer.h"
+#include "soc/spi_struct.h"  /* GPSPI2 — ESP32-C3 SPI2 peripheral registers */
 
 // MT6701 sensors share the SPI2 bus with the W25Q64 external flash.
 // ext_flash.c initialises the bus (GPIO 4=CLK, 5=MISO, 6=MOSI); each sensor
@@ -38,6 +40,22 @@ static spi_device_handle_t s_devs[MT6701_NUM_SENSORS];
 static float               s_last_deg[MT6701_NUM_SENSORS];
 static bool                s_present[MT6701_NUM_SENSORS];
 static bool                s_error[MT6701_NUM_SENSORS];
+
+/* Snapshot of GPSPI2.misc.val captured during mt6701_acquire_bus() for each
+ * sensor.  The snapshot encodes which CSn_dis bits are clear (i.e. which
+ * hardware CS signal is routed to the GPIO matrix for that sensor) so the
+ * fast path can restore it before raising cmd.usr.  Captured once per bus
+ * acquire, since cs_pin_id / cs polarity / ck_idle_edge never change at
+ * runtime for these devices. */
+static uint32_t s_misc_snapshot[MT6701_NUM_SENSORS];
+static bool     s_fast_armed;      /* true between acquire_bus/release_bus  */
+
+/* Fast-path diagnostic counters — dumped on release_bus so the log line
+ * doesn't sit inside the 2.5 ms batch window.  Kept as plain uint32_t: only
+ * the acquisition task writes them. */
+static uint32_t s_fast_ok[MT6701_NUM_SENSORS];
+static uint32_t s_fast_crc_fail[MT6701_NUM_SENSORS];
+static uint32_t s_fast_mag_warn[MT6701_NUM_SENSORS];
 
 /**
  * @brief Computes a 6-bit CRC over 18 bits of sensor data.
@@ -255,12 +273,222 @@ bool mt6701_has_error(int sensor) {
     return s_error[sensor];
 }
 
+/**
+ * @brief Acquire the SPI2 bus exclusively for fast multi-sensor bulk reads.
+ *
+ * Locks the bus via sensor 0's device handle (any handle works — they share
+ * the same bus mutex) and then performs one driver-based "priming" read per
+ * present sensor.  Priming has two jobs:
+ *   1. Let spi_hal_setup_device() configure GPSPI2.ctrl / user1 / timing
+ *      registers for each sensor's mode, polarity, and clock divider.
+ *   2. Capture GPSPI2.misc.val at the moment each sensor is active — this
+ *      snapshot contains the CSn_dis bit pattern that routes the hardware
+ *      CS signal to that sensor's GPIO.  We need per-sensor snapshots
+ *      because the fast read bypasses spi_hal_setup_device() entirely.
+ *
+ * After this function returns, mt6701_get_degrees_fast() can switch between
+ * sensors just by writing GPSPI2.misc.val = s_misc_snapshot[sensor] — a
+ * single-register write that takes a few nanoseconds.
+ */
 void mt6701_acquire_bus(void) {
-    /* Acquire via sensor 0's handle — all sensors share the same SPI bus,
-     * so holding it through one device blocks the others' bus arbitration. */
     spi_device_acquire_bus(s_devs[0], portMAX_DELAY);
+
+    /* Prime every present sensor in order, recording the hardware-CS config
+     * the driver ends up with each time.  Absent sensors are skipped — their
+     * snapshot stays zero and get_degrees_fast() short-circuits on them. */
+    uint8_t rx[3] = {0};
+    spi_transaction_t prime = {.length = 24, .rxlength = 24, .rx_buffer = rx};
+    for (int i = 0; i < MT6701_NUM_SENSORS; i++) {
+        if (!s_present[i]) continue;
+        /* polling_transmit runs spi_hal_setup_device(), which calls
+         * spi_ll_master_select_cs() → writes GPSPI2.misc appropriately. */
+        esp_err_t err = spi_device_polling_transmit(s_devs[i], &prime);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "acquire_bus: sensor %d prime failed: %s",
+                     i, esp_err_to_name(err));
+            s_misc_snapshot[i] = 0;
+            continue;
+        }
+        s_misc_snapshot[i] = GPSPI2.misc.val;
+        ESP_LOGD(TAG, "acquire_bus: sensor %d misc=0x%08lx (cs_dis=%c%c%c%c%c%c)",
+                 i, (unsigned long)s_misc_snapshot[i],
+                 GPSPI2.misc.cs0_dis ? '1' : '0',
+                 GPSPI2.misc.cs1_dis ? '1' : '0',
+                 GPSPI2.misc.cs2_dis ? '1' : '0',
+                 GPSPI2.misc.cs3_dis ? '1' : '0',
+                 GPSPI2.misc.cs4_dis ? '1' : '0',
+                 GPSPI2.misc.cs5_dis ? '1' : '0');
+    }
+
+    /* CRITICAL: the SPI2 bus is DMA-enabled (ext_flash_init() passed
+     * SPI_DMA_CH_AUTO).  After the priming read, GPSPI2.dma_conf.dma_rx_ena
+     * is still 1 and the DMA in-link points to the now-out-of-scope stack
+     * buffer `rx[3]`.  If we leave DMA armed, fast-path reads clock MISO
+     * into that stale DMA target instead of data_buf[0] — producing the
+     * all-zeros frames we were chasing.  Disable DMA for the duration of
+     * the fast-path burst and let the peripheral use its CPU-visible
+     * work registers (data_buf[]) as fallback.  release_bus() does not
+     * re-enable DMA explicitly; the next driver-based transaction (e.g.
+     * mt6701_get_degrees() or an ext_flash access) will re-arm it via
+     * s_spi_dma_prepare_data(). */
+    GPSPI2.dma_conf.dma_rx_ena = 0;
+    GPSPI2.dma_conf.dma_tx_ena = 0;
+    /* Reset the RX AFIFO so any in-flight DMA-fed bits are flushed before
+     * the first CPU-mode transaction — otherwise the hardware shift chain
+     * may still hold junk from the priming transfer. */
+    GPSPI2.dma_conf.rx_afifo_rst = 1;
+    GPSPI2.dma_conf.buf_afifo_rst = 1;
+
+    s_fast_armed = true;
 }
 
+/**
+ * @brief Release the bus and log accumulated fast-read diagnostics.
+ *
+ * The stats counters are zeroed on each release so the next batch starts
+ * fresh.  We only emit a log line at DEBUG level to keep steady-state
+ * 60 Hz streaming quiet; bump esp_log_level_set("mt6701", ESP_LOG_DEBUG)
+ * to see per-batch CRC/mag-warn counts.
+ */
 void mt6701_release_bus(void) {
+    s_fast_armed = false;
+    /* Aggregate 1-second windows of fast-read stats so we don't spam the UART
+     * once per 2.5 ms batch.  The acquisition task calls release_bus() every
+     * batch; we only emit when either a second has elapsed or an error was
+     * seen, so a clean 60 Hz stream produces exactly one line per second. */
+    static int64_t s_stats_window_start_us = 0;
+    static uint32_t s_win_ok[MT6701_NUM_SENSORS];
+    static uint32_t s_win_crc[MT6701_NUM_SENSORS];
+    static uint32_t s_win_mag[MT6701_NUM_SENSORS];
+
+    int64_t now_us = esp_timer_get_time();
+    if (s_stats_window_start_us == 0) s_stats_window_start_us = now_us;
+
+    for (int i = 0; i < MT6701_NUM_SENSORS; i++) {
+        s_win_ok[i]  += s_fast_ok[i];
+        s_win_crc[i] += s_fast_crc_fail[i];
+        s_win_mag[i] += s_fast_mag_warn[i];
+        s_fast_ok[i] = s_fast_crc_fail[i] = s_fast_mag_warn[i] = 0;
+    }
+
+    if (now_us - s_stats_window_start_us >= 1000000) {
+        for (int i = 0; i < MT6701_NUM_SENSORS; i++) {
+            if (!s_present[i]) continue;
+            /* Log as WARN only if something went wrong this window; otherwise
+             * keep it at DEBUG so a clean 18 kHz stream stays silent.  The
+             * `ok` count alone would spam the UART at 60 Hz. */
+            esp_log_level_t lvl = (s_win_crc[i] || s_win_mag[i])
+                                    ? ESP_LOG_WARN : ESP_LOG_DEBUG;
+            ESP_LOG_LEVEL(lvl, TAG,
+                          "fast stats 1s: sensor %d ok=%lu crc_fail=%lu mag_warn=%lu",
+                          i,
+                          (unsigned long)s_win_ok[i],
+                          (unsigned long)s_win_crc[i],
+                          (unsigned long)s_win_mag[i]);
+            s_win_ok[i] = s_win_crc[i] = s_win_mag[i] = 0;
+        }
+        s_stats_window_start_us = now_us;
+    }
+
     spi_device_release_bus(s_devs[0]);
+}
+
+/**
+ * @brief Direct-register read of one MT6701 sensor (~7 µs).
+ *
+ * Must be called between mt6701_acquire_bus() / mt6701_release_bus().
+ * Switches the hardware CS to @p sensor by restoring the snapshot captured
+ * during acquire_bus(), re-arms the transfer length and MISO capture flag
+ * (the driver's post-transaction cleanup clears usr_miso), then fires
+ * cmd.usr and busy-polls for completion.  Total cost is dominated by the
+ * 24 clocks @ 4 MHz = 6 µs bit-bang time; the register pokes add <200 ns.
+ *
+ * @return Angle in degrees [0, 360) on success, or the last valid reading
+ *         on CRC failure (with s_error[sensor] set).
+ */
+float mt6701_get_degrees_fast(int sensor) {
+    if (sensor < 0 || sensor >= MT6701_NUM_SENSORS) return 0.0f;
+    if (!s_present[sensor]) return 0.0f;
+    if (!s_fast_armed) {
+        /* Misuse — fall back to the driver path so we still return a sane
+         * value.  Log once; spamming here would tank performance. */
+        static bool warned = false;
+        if (!warned) {
+            ESP_LOGE(TAG, "get_degrees_fast called without acquire_bus — "
+                          "falling back to driver path");
+            warned = true;
+        }
+        return mt6701_get_degrees(sensor);
+    }
+
+    /* Route the hardware CS to this sensor's pin.  GPSPI2.misc also carries
+     * ck_idle_edge and master_cs_pol — we captured them intact so this write
+     * preserves mode-3 clock polarity and active-low CS. */
+    GPSPI2.misc.val = s_misc_snapshot[sensor];
+
+    /* Re-arm MISO capture and transfer length before each transaction.
+     * spi_post_trans_cleanup() clears usr_miso after the priming read in
+     * acquire_bus(), leaving the peripheral ready to clock SCK but not
+     * capture MISO — data_buf would stay stale.
+     *
+     * IMPORTANT: the device was added to the driver without SPI_DEVICE_HALFDUPLEX,
+     * so GPSPI2.user.doutdin is set to 1 (full duplex).  In full-duplex mode the
+     * peripheral only transfers when usr_mosi is enabled — writing usr_mosi=0
+     * here would cause cmd.usr to self-clear without actually clocking SCK, and
+     * data_buf would stay stale (reading 0 repeatedly on first acquire, then the
+     * last successful frame forever after).  Keep usr_mosi=1: the MT6701 ignores
+     * MOSI (it's a read-only SSI device) and the outgoing bits are don't-care. */
+    /* Clear trans_done int so the next transaction has a clean completion
+     * flag — even though we poll cmd.usr (which auto-clears on ESP32-C3),
+     * the driver's assert() in spi_hal_user_start checks trans_done.  We
+     * don't call that path, but clearing it matches the driver's ordering
+     * and protects against future register-state leaks. */
+    GPSPI2.dma_int_raw.trans_done = 0;
+
+    GPSPI2.ms_dlen.ms_data_bitlen = 23;  /* 24-bit transfer (N-1 encoding) */
+    /* Write the whole user register in one shot to guarantee a consistent
+     * state — bit-field writes would be three separate RMW cycles each of
+     * which could race with a lingering register shadow.  We want:
+     *   doutdin=1 (full duplex, as driver configured during priming),
+     *   usr_miso=1, usr_mosi=1, everything else 0. */
+    {
+        typeof(GPSPI2.user) u = { .val = 0 };
+        u.doutdin  = 1;
+        u.usr_miso = 1;
+        u.usr_mosi = 1;
+        GPSPI2.user = u;
+    }
+    GPSPI2.data_buf[0] = 0;              /* MOSI payload — don't-care */
+    GPSPI2.cmd.update = 1;               /* latch user/ms_dlen into shadow regs */
+    while (GPSPI2.cmd.update);
+    GPSPI2.cmd.usr = 1;
+    while (GPSPI2.cmd.usr);   /* busy-poll — completes in ~6 µs at 4 MHz */
+
+    /* data_buf[0] stores received bytes little-endian: first received byte at
+     * bits [7:0].  MT6701 sends MSByte first → reconstruct as big-endian 24-bit. */
+    uint32_t buf = GPSPI2.data_buf[0];
+    uint32_t raw = ((buf & 0x0000FFu) << 16)
+                 |  (buf & 0x00FF00u)
+                 | ((buf & 0xFF0000u) >> 16);
+
+    uint8_t crc_recv = raw & CRC_MASK;
+    uint8_t crc_calc = crc6_compute(raw >> STATUS_SHIFT);
+    if (crc_calc != crc_recv) {
+        s_fast_crc_fail[sensor]++;
+        /* Verbose-only: one line per failure would flood the UART at 60 Hz.
+         * Promote to WARN if every read for this sensor is failing. */
+        ESP_LOGV(TAG, "fast sensor %d CRC fail raw=0x%06lx recv=0x%02x calc=0x%02x",
+                 sensor, (unsigned long)raw, crc_recv, crc_calc);
+        s_error[sensor] = true;
+        return s_last_deg[sensor];
+    }
+
+    uint8_t status = (raw >> STATUS_SHIFT) & STATUS_MASK;
+    bool mag_fault = !!(status & (MAG_WEAK_BIT | MAG_STRONG_BIT));
+    if (mag_fault) s_fast_mag_warn[sensor]++;
+    else           s_fast_ok[sensor]++;
+
+    s_error[sensor]    = mag_fault;
+    s_last_deg[sensor] = (float)((raw >> ANGLE_SHIFT) & ANGLE_MASK) * (360.0f / 16384.0f);
+    return s_last_deg[sensor];
 }

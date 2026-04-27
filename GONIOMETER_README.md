@@ -224,7 +224,7 @@ For upper-extremity: sensor 0 = Elbow, others configured per session.
 | FSM | `IDLE` ↔ `ACTIVE_READINGS` state machine with sensor power gating (§2.3) |
 | Compiler optimization hardening | Race conditions in `webrtc.c` and `app_runtime.c` must be fixed first — see §7.5 |
 | UDP socket backpressure at 400 Hz | `ENOBUFS` bursts from `socket.c:128` at max rate; investigate lwIP/FreeRTOS tick resolution — see §7.4 |
-| HFHL delta wire-format compression | Implement v2 batch format (5.3× ratio, lifts 10 kHz rate cap) — see §7.7 |
+| ~~HFHL delta wire-format compression~~ | Done — v2 batch format live in `hfhl_ws.c`; 10 kHz cap removed; web decoder in `ws.ts` via `parsePacketV2` — see §7.7 |
 
 **Web App**
 | Item | Notes |

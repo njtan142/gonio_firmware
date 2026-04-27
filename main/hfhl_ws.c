@@ -51,18 +51,18 @@ static void pack_frame(uint8_t *buf, float deg, int64_t t_us, uint16_t flags) {
  * ws_job_t is a tiny header-only struct — no per-send heap allocation for payload.
  */
 #define WS_SEND_SAMPLES 512  /* send buffer chunk — flush loop drains remaining */
-/* TCP ceiling: ~400 KB/s ÷ 32 B/sample ≈ 12,500 Hz.  Cap at 10,000 to leave
- * headroom for overhead and WiFi jitter.  Remove once delta compression lands. */
-#define HFHL_MAX_SAMPLE_HZ 10000
 
-static uint8_t           s_send_buf[WS_SEND_SAMPLES * RB_SAMPLE_SIZE];
+/* Both buffers are heap-allocated on WS connect and freed on disconnect so the
+ * DTLS context can reclaim RAM during WebRTC sessions (§7.5). */
+static uint8_t          *s_send_buf     = NULL; /* WS_SEND_SAMPLES × RB_SAMPLE_SIZE bytes */
+static uint8_t          *s_compress_buf = NULL; /* 4096 bytes: v2 compressed output */
 static SemaphoreHandle_t s_send_sem; /* 1 = buffer free, 0 = send in flight */
 
 typedef struct {
   httpd_handle_t server;
   int fd;
   size_t len;
-  uint8_t *data; /* points into s_send_buf — NOT owned by this job */
+  uint8_t *data; /* points into s_compress_buf — NOT owned by this job */
 } ws_job_t;
 
 static void ws_send_cb(void *arg) {
@@ -78,7 +78,13 @@ static void ws_send_cb(void *arg) {
     s_acq_run = false;
     s_client_fd = -1;
     rb_free();
+    /* Give semaphore before freeing so ws_flush_task exits its NULL guard cleanly */
+    xSemaphoreGive(s_send_sem);
+    free(s_send_buf);     s_send_buf     = NULL;
+    free(s_compress_buf); s_compress_buf = NULL;
     ESP_LOGW(TAG, "ws send failed — client fd=%d dropped", job->fd);
+    free(job);
+    return;
   }
   xSemaphoreGive(s_send_sem); /* buffer is free to refill */
   free(job);
@@ -104,6 +110,79 @@ static float decode_angle(const uint8_t *sample, int sensor) {
   for (int i = 0; i < 8; i++) frame = (frame << 8) | b[i];
   uint16_t raw = (uint16_t)((frame >> 50) & 0x3FFF);
   return raw * (360.0f / 16384.0f);
+}
+
+/* ── v2 batch compression ────────────────────────────────────────────────────
+ * Wire format (v2):
+ *   Header 18 B: [0]=2, [1-2]=sample_count LE, [3-6]=base_ts LE,
+ *                [7-14]=4×uint16_t base_angles LE, [15]=soc, [16-17]=flags LE
+ *   Per delta (6 B per sample 1..n-1):
+ *                [0-3]=4×int8_t delta_angle, [4-5]=uint16_t delta_ts LE
+ * Returns number of bytes written to out (≤ 4096 for n ≤ 512). */
+static int compress_batch(const uint8_t *raw, int n, uint8_t *out) {
+  if (n == 0) return 0;
+
+  /* Decode first sample — sensor 0 carries ts/soc/flags shared across all 4 */
+  uint64_t f0 = 0;
+  for (int i = 0; i < 8; i++) f0 = (f0 << 8) | raw[i];
+  uint32_t base_ts = (uint32_t)((f0 >> 18) & 0xFFFFFFFFULL);
+  uint8_t  soc     = (uint8_t)((f0 >> 10) & 0xFF);
+  uint16_t flags   = (uint16_t)(f0 & 0x3FF);
+
+  uint16_t prev_ang[4];
+  for (int s = 0; s < 4; s++) {
+    uint64_t sf = 0;
+    const uint8_t *b = raw + s * 8;
+    for (int i = 0; i < 8; i++) sf = (sf << 8) | b[i];
+    prev_ang[s] = (uint16_t)((sf >> 50) & 0x3FFF);
+  }
+
+  /* Header */
+  out[0] = 2;
+  out[1] = (uint8_t)(n        & 0xFF);
+  out[2] = (uint8_t)((n >> 8) & 0xFF);
+  out[3] = (uint8_t)(base_ts         & 0xFF);
+  out[4] = (uint8_t)((base_ts >>  8) & 0xFF);
+  out[5] = (uint8_t)((base_ts >> 16) & 0xFF);
+  out[6] = (uint8_t)((base_ts >> 24) & 0xFF);
+  for (int s = 0; s < 4; s++) {
+    out[7 + s * 2]     = (uint8_t)( prev_ang[s]       & 0xFF);
+    out[7 + s * 2 + 1] = (uint8_t)((prev_ang[s] >> 8) & 0xFF);
+  }
+  out[15] = soc;
+  out[16] = (uint8_t)( flags       & 0xFF);
+  out[17] = (uint8_t)((flags >> 8) & 0xFF);
+
+  int pos = 18;
+  uint32_t prev_ts = base_ts;
+
+  for (int t = 1; t < n; t++) {
+    const uint8_t *sample = raw + (size_t)t * RB_SAMPLE_SIZE;
+
+    uint64_t sf0 = 0;
+    for (int i = 0; i < 8; i++) sf0 = (sf0 << 8) | sample[i];
+    uint32_t curr_ts  = (uint32_t)((sf0 >> 18) & 0xFFFFFFFFULL);
+    uint16_t delta_ts = (uint16_t)((curr_ts - prev_ts) & 0xFFFF);
+    prev_ts = curr_ts;
+
+    for (int s = 0; s < 4; s++) {
+      uint64_t sf = 0;
+      const uint8_t *b = sample + s * 8;
+      for (int i = 0; i < 8; i++) sf = (sf << 8) | b[i];
+      uint16_t curr_ang = (uint16_t)((sf >> 50) & 0x3FFF);
+      int d = (int)curr_ang - (int)prev_ang[s];
+      if (d >  8192) d -= 16384;  /* wrap-around toward 0 */
+      if (d < -8192) d += 16384;
+      if (d >  127)  d =  127;    /* clamp — only hits if joint moves >2.79°/sample */
+      if (d < -128)  d = -128;
+      out[pos + s] = (uint8_t)(int8_t)d;
+      prev_ang[s] = curr_ang;
+    }
+    out[pos + 4] = (uint8_t)( delta_ts       & 0xFF);
+    out[pos + 5] = (uint8_t)((delta_ts >> 8) & 0xFF);
+    pos += 6;
+  }
+  return pos;
 }
 
 static void ws_flush_task(void *pv) {
@@ -135,6 +214,12 @@ static void ws_flush_task(void *pv) {
       goto maybe_log;
     }
 
+    if (!s_send_buf || !s_compress_buf) {
+      xSemaphoreGive(s_send_sem);
+      vTaskDelay(pdMS_TO_TICKS(100));
+      goto maybe_log;
+    }
+
     int available = rb_count();
     int n = (available < WS_SEND_SAMPLES) ? available : WS_SEND_SAMPLES;
     int popped = rb_pop_batch(s_send_buf, n);
@@ -142,6 +227,8 @@ static void ws_flush_task(void *pv) {
       xSemaphoreGive(s_send_sem);
       goto maybe_log;
     }
+
+    int compressed_len = compress_batch(s_send_buf, popped, s_compress_buf);
 
     ws_job_t *job = malloc(sizeof(ws_job_t)); /* tiny header only — always succeeds */
     if (!job) {
@@ -151,8 +238,8 @@ static void ws_flush_task(void *pv) {
     }
     job->server  = s_server;
     job->fd      = fd;
-    job->data    = s_send_buf;
-    job->len     = (size_t)popped * RB_SAMPLE_SIZE;
+    job->data    = s_compress_buf;
+    job->len     = (size_t)compressed_len;
     size_t bytes = job->len; /* snapshot before hand-off — ws_send_cb frees job */
 
 #if ENABLE_WS_DATA_TRACE
@@ -218,12 +305,16 @@ static void sensor_acq_task(void *pv) {
 
     /* Read fpp samples back-to-back in a tight loop — each gets its
      * own hardware timestamp so the receiver can recover real timing.
-     * HFHL: block when the ring buffer is full rather than dropping.
-     * The flush task drains at TCP rate; the producer pauses during TCP
-     * flow-control stalls so no acquired data is ever lost. */
+     * Hold the SPI bus for the entire batch so spi_device_polling_transmit
+     * skips the per-transaction mutex acquire/release (~43 µs overhead each).
+     * Without this, 46 separate acquires dominate the 2,500 µs batch window.
+     * HFHL: block when the ring buffer is full rather than dropping. */
+    mt6701_acquire_bus();
     for (int f = 0; f < fpp && s_acq_run; f++) {
       while (s_acq_run && rb_count() >= RB_CAPACITY) {
+        mt6701_release_bus();
         vTaskDelay(1); /* yield until consumer frees space */
+        mt6701_acquire_bus();
       }
       if (!s_acq_run) break;
 
@@ -231,7 +322,7 @@ static void sensor_acq_task(void *pv) {
       float deg[4];
       uint16_t flags = 0;
       for (int i = 0; i < 4; i++) {
-        deg[i] = mt6701_get_degrees(i);
+        deg[i] = mt6701_get_degrees_fast(i);
         if (mt6701_has_error(i)) {
           flags |= (uint16_t)(1u << (9 - i));
           stat_err_flags |= (1u << i);
@@ -245,6 +336,7 @@ static void sensor_acq_task(void *pv) {
       rb_push(sample);
       stat_produced++;
     }
+    mt6701_release_bus();
 
     /* Wait for the next batch period.  On single-core ESP32-C3,
      * we MUST call vTaskDelay (not taskYIELD) so the lower-priority
@@ -288,11 +380,20 @@ static esp_err_t ws_handler(httpd_req_t *req) {
       ESP_LOGE(TAG, "OOM — cannot allocate ring buffer for WS client");
       return ESP_ERR_NO_MEM;
     }
+    s_send_buf     = malloc((size_t)WS_SEND_SAMPLES * RB_SAMPLE_SIZE);
+    s_compress_buf = malloc(4096);
+    if (!s_send_buf || !s_compress_buf) {
+      ESP_LOGE(TAG, "OOM — cannot allocate send buffers for WS client");
+      free(s_send_buf);     s_send_buf     = NULL;
+      free(s_compress_buf); s_compress_buf = NULL;
+      rb_free();
+      return ESP_ERR_NO_MEM;
+    }
     s_client_fd = httpd_req_to_sockfd(req);
     rb_reset();
     s_acq_run = true;
-    ESP_LOGI(TAG, "WS client connected fd=%d — acquisition started",
-             s_client_fd);
+    ESP_LOGI(TAG, "WS client connected fd=%d — acquisition started (heap free: %u)",
+             s_client_fd, (unsigned)esp_get_free_heap_size());
     return ESP_OK;
   }
   /* Drain any data frame the client sends — firmware does not parse them. */
@@ -303,6 +404,8 @@ static esp_err_t ws_handler(httpd_req_t *req) {
     s_acq_run = false;
     s_client_fd = -1;
     rb_free();
+    free(s_send_buf);     s_send_buf     = NULL;
+    free(s_compress_buf); s_compress_buf = NULL;
     return ret;
   }
   if (pkt.len > 0) {
@@ -343,20 +446,20 @@ void hfhl_ws_set_batch_params(int fpp, int freq_hz) {
     s_acq_fpp = fpp;
   if (freq_hz >= 1 && freq_hz <= 1000)
     s_acq_freq_hz = freq_hz;
-  /* Clamp to TCP throughput ceiling — prevents ring buffer fill and producer stalls */
-  if (s_acq_fpp * s_acq_freq_hz > HFHL_MAX_SAMPLE_HZ) {
-    s_acq_freq_hz = HFHL_MAX_SAMPLE_HZ / s_acq_fpp;
-    if (s_acq_freq_hz < 1) s_acq_freq_hz = 1;
-  }
-  ESP_LOGI(TAG, "HFHL batch params: fpp=%d freq=%dHz -> total=%dHz (cap=%dHz)",
-           s_acq_fpp, s_acq_freq_hz, s_acq_fpp * s_acq_freq_hz, HFHL_MAX_SAMPLE_HZ);
+  ESP_LOGI(TAG, "HFHL batch params: fpp=%d freq=%dHz -> total=%dHz",
+           s_acq_fpp, s_acq_freq_hz, s_acq_fpp * s_acq_freq_hz);
 }
 
 void hfhl_ws_stop(void) {
   s_acq_run = false;
   s_client_fd = -1;
   rb_free();
-  ESP_LOGI(TAG, "HFHL acquisition stopped");
+  /* Wait for any in-flight ws_send_cb to finish before freeing its buffer */
+  xSemaphoreTake(s_send_sem, pdMS_TO_TICKS(500));
+  xSemaphoreGive(s_send_sem);
+  free(s_send_buf);     s_send_buf     = NULL;
+  free(s_compress_buf); s_compress_buf = NULL;
+  ESP_LOGI(TAG, "HFHL acquisition stopped (heap free: %u)", (unsigned)esp_get_free_heap_size());
 }
 
 bool hfhl_ws_is_connected(void) { return s_client_fd >= 0; }

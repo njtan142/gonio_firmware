@@ -3,7 +3,7 @@
 #include <stdbool.h>
 
 #define RB_SAMPLE_SIZE  32     /* 4 sensors × 8 bytes per timestep */
-#define RB_CAPACITY      1536  /* 48 KB BSS ring; send buf fixed at 16 KB — 64 KB total WS BSS */
+#define RB_CAPACITY       500  /* heap-allocated on WS connect: 500 × 32 B = 16 KB (§7.5) */
 
 /* Call once at startup — creates the mutex only, does NOT allocate the buffer. */
 void rb_init(void);
