@@ -66,7 +66,11 @@ typedef struct {
 } ws_job_t;
 
 static void ws_send_cb(void *arg) {
+  // Cast the generic void pointer back to our specific websocket job structure
   ws_job_t *job = (ws_job_t *)arg;
+  
+  // Construct the websocket frame. We send binary data (compressed batches) 
+  // as complete, unfragmented frames.
   httpd_ws_frame_t frame = {
       .final = true,
       .fragmented = false,
@@ -74,19 +78,42 @@ static void ws_send_cb(void *arg) {
       .payload = job->data,
       .len = job->len,
   };
+  
+  // Asynchronously dispatch the frame to the underlying socket.
+  // If this fails, it usually means the client abruptly disconnected.
   if (httpd_ws_send_frame_async(job->server, job->fd, &frame) != ESP_OK) {
+    // Stop the high-frequency sensor acquisition task immediately
     s_acq_run = false;
+    
+    // Clear the active client file descriptor so we know the socket is dead
     s_client_fd = -1;
+    
+    // Free the ring buffer memory since no client is connected to consume it
     rb_free();
-    /* Give semaphore before freeing so ws_flush_task exits its NULL guard cleanly */
+    
+    // Release the semaphore BEFORE freeing the buffers. This ensures that if
+    // ws_flush_task is blocked waiting on this semaphore, it will wake up
+    // and cleanly exit its processing loop when it notices the buffers are NULL.
     xSemaphoreGive(s_send_sem);
+    
+    // Deallocate the temporary staging and compression buffers to save heap memory
     free(s_send_buf);     s_send_buf     = NULL;
     free(s_compress_buf); s_compress_buf = NULL;
+    
+    // Log the disconnection event
     ESP_LOGW(TAG, "ws send failed — client fd=%d dropped", job->fd);
+    
+    // Free the memory allocated for the job argument itself
     free(job);
     return;
   }
-  xSemaphoreGive(s_send_sem); /* buffer is free to refill */
+  
+  // If the send succeeded, release the semaphore. This signals ws_flush_task 
+  // that the buffers are no longer in use by the HTTP server task and can be safely
+  // overwritten with the next batch of data.
+  xSemaphoreGive(s_send_sem); 
+  
+  // Free the memory allocated for the job argument
   free(job);
 }
 
@@ -122,11 +149,21 @@ static float decode_angle(const uint8_t *sample, int sensor) {
 static int compress_batch(const uint8_t *raw, int n, uint8_t *out) {
   if (n == 0) return 0;
 
-  /* Decode first sample — sensor 0 carries ts/soc/flags shared across all 4 */
+  // Decode the very first sample in the batch to establish the baseline values.
+  // Sensor 0's slot carries the global timestamp, SoC, and flags shared by all sensors.
   uint64_t f0 = 0;
+  
+  // Reconstruct the 64-bit word for sensor 0 by shifting in 8 bytes sequentially (big-endian)
   for (int i = 0; i < 8; i++) f0 = (f0 << 8) | raw[i];
+  
+  // Extract the 32-bit timestamp (bits 18-49) by shifting right 18 bits.
+  // The top 14 bits (50-63) hold the angle, which we ignore here.
   uint32_t base_ts = (uint32_t)((f0 >> 18) & 0xFFFFFFFFULL);
+  
+  // Extract the 8-bit State of Charge percentage (bits 10-17)
   uint8_t  soc     = (uint8_t)((f0 >> 10) & 0xFF);
+  
+  // Extract the bottom 10 bits (0-9) which hold system state flags
   uint16_t flags   = (uint16_t)(f0 & 0x3FF);
 
   uint16_t prev_ang[4];
@@ -422,10 +459,20 @@ static esp_err_t ws_handler(httpd_req_t *req) {
 /* ── Public API ─────────────────────────────────────────────────────────── */
 
 void hfhl_ws_init(httpd_handle_t server) {
+  // Store the global HTTP server handle for queuing asynchronous websocket frames later
   s_server   = server;
+  
+  // Create a binary semaphore to coordinate buffer handoffs between the flush task and the HTTP server
   s_send_sem = xSemaphoreCreateBinary();
-  xSemaphoreGive(s_send_sem); /* initially free */
-  rb_init(); /* mutex only — buffer stays on heap until a client connects */
+  
+  // The semaphore must be initially given (free) so the first buffer fill can proceed
+  xSemaphoreGive(s_send_sem); 
+  
+  // Initialize the ring buffer's internal synchronization primitives (mutex).
+  // Note: The actual heavy memory allocation is deferred until a client connects.
+  rb_init(); 
+  
+  // Register the WebSocket endpoint at the /ws URI
   httpd_uri_t uri = {
       .uri = "/ws",
       .method = HTTP_GET,
@@ -434,31 +481,58 @@ void hfhl_ws_init(httpd_handle_t server) {
       .handle_ws_control_frames = false,
   };
   httpd_register_uri_handler(server, &uri);
-  /* sensor_acq_task at same priority as peer_main_task so acquisitions
-   * are not starved; ws_flush_task at low priority (it blocks on network). */
+  
+  // Spawn the high-frequency sensor acquisition task.
+  // Priority 6 matches peer_main_task (WebRTC) to prevent hardware sampling starvation
+  // when the network stack is busy processing packets.
   xTaskCreate(sensor_acq_task, "hfhl_acq", 3072, NULL, 6, NULL);
+  
+  // Spawn the websocket flush task, which reads batches from the ring buffer.
+  // Runs at lower priority (4) because it mostly blocks waiting on the semaphore or network queues.
   xTaskCreate(ws_flush_task, "hfhl_flush", 4096, NULL, 4, NULL);
+  
   ESP_LOGI(TAG, "HFHL WebSocket ready at ws://192.168.4.1/ws");
 }
 
 void hfhl_ws_set_batch_params(int fpp, int freq_hz) {
+  // Validate and update the frames-per-packet (batch size). 
+  // Max 46 frames fit into a standard 1472-byte MTU payload.
   if (fpp >= 1 && fpp <= 46)
     s_acq_fpp = fpp;
+    
+  // Validate and update the network transmission frequency (how often batches are sent).
+  // Clamped between 1 Hz and 1000 Hz.
   if (freq_hz >= 1 && freq_hz <= 1000)
     s_acq_freq_hz = freq_hz;
+    
+  // Log the updated configuration, computing the effective total sensor sampling rate
   ESP_LOGI(TAG, "HFHL batch params: fpp=%d freq=%dHz -> total=%dHz",
            s_acq_fpp, s_acq_freq_hz, s_acq_fpp * s_acq_freq_hz);
 }
 
 void hfhl_ws_stop(void) {
+  // Signal the high-frequency sensor acquisition task to stop polling the SPI bus
   s_acq_run = false;
+  
+  // Invalidate the client socket file descriptor to prevent any further network writes
   s_client_fd = -1;
+  
+  // Safely deallocate the ring buffer memory
   rb_free();
-  /* Wait for any in-flight ws_send_cb to finish before freeing its buffer */
+  
+  // Wait up to 500ms to acquire the send semaphore. This ensures that if an asynchronous
+  // websocket send (ws_send_cb) is currently in-flight, we wait for it to complete
+  // before we pull the underlying memory buffers out from under the HTTP server task.
   xSemaphoreTake(s_send_sem, pdMS_TO_TICKS(500));
+  
+  // Immediately release the semaphore once we know the in-flight send has cleared
   xSemaphoreGive(s_send_sem);
+  
+  // Free the temporary staging and compression buffers to reclaim heap memory
   free(s_send_buf);     s_send_buf     = NULL;
   free(s_compress_buf); s_compress_buf = NULL;
+  
+  // Log the successful teardown and report the reclaimed heap size
   ESP_LOGI(TAG, "HFHL acquisition stopped (heap free: %u)", (unsigned)esp_get_free_heap_size());
 }
 

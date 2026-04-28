@@ -47,17 +47,23 @@ static void ssd1306_command(uint8_t command) {
  * @brief Initializes the shared I2C master bus.
  */
 void i2c_master_init(void) {
-    // Shared I2C bus for both OLED and INA219.
+    // Configure the shared I2C bus that will be used by both the SSD1306 OLED and the INA219 power monitor.
     i2c_config_t conf = {
-        .mode = I2C_MODE_MASTER,
-        .sda_io_num = I2C_MASTER_SDA_IO,
-        .scl_io_num = I2C_MASTER_SCL_IO,
-        // Enable internal pullups; usually required for I2C to idle HIGH.
+        .mode = I2C_MODE_MASTER, // Set the ESP32 to act as the I2C master
+        .sda_io_num = I2C_MASTER_SDA_IO, // Data line GPIO pin mapping
+        .scl_io_num = I2C_MASTER_SCL_IO, // Clock line GPIO pin mapping
+        // Enable the ESP32's internal pull-up resistors on both the SDA and SCL lines.
+        // This is typically required for the I2C bus to correctly idle in the HIGH state.
         .sda_pullup_en = GPIO_PULLUP_ENABLE,
         .scl_pullup_en = GPIO_PULLUP_ENABLE,
-        .master.clk_speed = I2C_MASTER_FREQ_HZ,
+        .master.clk_speed = I2C_MASTER_FREQ_HZ, // Set the clock frequency (e.g., 400kHz fast mode)
     };
+    
+    // Apply the hardware configuration parameters to the specified I2C controller port
     i2c_param_config(I2C_MASTER_NUM, &conf);
+    
+    // Install the driver into the OS. We disable the RX and TX software buffers
+    // (set to 0) because we are operating in master mode, which manages transfers directly.
     i2c_driver_install(I2C_MASTER_NUM, conf.mode, I2C_MASTER_RX_BUF_DISABLE, I2C_MASTER_TX_BUF_DISABLE, 0);
 }
 

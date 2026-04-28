@@ -21,8 +21,9 @@ static const char *TAG = "web_server";
 // Fallback client address captured from AP events when socket peer lookup fails.
 static char g_last_sta_ip[INET_ADDRSTRLEN] = "";
 
-#define WIFI_SSID "ESP32-Monitor"
-#define WIFI_PASS "12345678"
+// Wi-Fi Access Point Credentials
+#define WIFI_SSID "ESP32-Monitor" // The public SSID broadcasted by the ESP32 in Access Point mode.
+#define WIFI_PASS "12345678"      // The WPA2-PSK password required for clients (phones/laptops) to connect to the AP.
 
 /**
  * @brief Gets the last station IP assigned by the AP.
@@ -49,18 +50,28 @@ const char *web_server_get_last_sta_ip(void) {
  */
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                int32_t event_id, void *event_data) {
+  // Handle the event when a new client (station) successfully authenticates and connects to our AP.
   if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STACONNECTED) {
     wifi_event_ap_staconnected_t *e = event_data;
     ESP_LOGI(TAG, "Station joined AID=%d", e->aid);
+    
+  // Handle the event when a client disconnects from our AP.
   } else if (event_base == WIFI_EVENT &&
              event_id == WIFI_EVENT_AP_STADISCONNECTED) {
     wifi_event_ap_stadisconnected_t *e = event_data;
     ESP_LOGI(TAG, "Station left AID=%d", e->aid);
+    
+  // Handle the event when the internal DHCP server assigns an IP address to the connected client.
   } else if (event_base == IP_EVENT &&
              event_id == IP_EVENT_AP_STAIPASSIGNED) {
-    // Cache most recent station IP for SDP/ICE mDNS rewrites.
+    // Cast the generic event payload to the IP assignment structure
     ip_event_ap_staipassigned_t *e = event_data;
+    
+    // Convert the raw IP address into a human-readable string and cache it in a global variable.
+    // We need this cached IP later when generating WebRTC SDP offers and ICE candidates,
+    // to dynamically rewrite mDNS addresses or 0.0.0.0 into the client's actual routable IP.
     snprintf(g_last_sta_ip, sizeof(g_last_sta_ip), IPSTR, IP2STR(&e->ip));
+    
     ESP_LOGI(TAG, "Station got IP: %s", g_last_sta_ip);
   }
 }
@@ -79,8 +90,12 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
  *    which is critical for the SDP IP-rewriting logic.
  */
 void wifi_init_softap(void) {
-  // NVS must be ready before Wi-Fi init; erase/reinit if partition state changed.
+  // 1. Non-Volatile Storage (NVS) Initialization
+  // The ESP32 Wi-Fi driver requires NVS to store calibration data and PHY configurations.
   esp_err_t ret = nvs_flash_init();
+  
+  // If the NVS partition is corrupted (no free pages) or contains a layout from a different 
+  // ESP-IDF version, we must safely erase and reformat it before proceeding.
   if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
       ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
     ESP_ERROR_CHECK(nvs_flash_erase());
@@ -88,39 +103,56 @@ void wifi_init_softap(void) {
   }
   ESP_ERROR_CHECK(ret);
 
-  // AP mode networking stack + default event loop.
+  // 2. Network Stack and Event Loop Initialization
+  // Initialize the underlying LwIP TCP/IP stack.
   ESP_ERROR_CHECK(esp_netif_init());
+  
+  // Create the default system event loop which handles Wi-Fi and IP events asynchronously.
   ESP_ERROR_CHECK(esp_event_loop_create_default());
-  // Creates default AP netif object used by esp_wifi in AP mode.
+  
+  // Create the default network interface instance specifically configured for Access Point (AP) mode.
   esp_netif_create_default_wifi_ap();
 
+  // Initialize the Wi-Fi driver with the default configuration parameters.
   wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
   ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
-  // Register both generic AP station events and IP-assigned events.
+  // 3. Event Handler Registration
+  // We need to passively monitor when clients connect to our AP and when the DHCP server 
+  // assigns them an IP address. This is critical for our WebRTC SDP IP-rewriting logic.
   ESP_ERROR_CHECK(esp_event_handler_instance_register(
       WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL, NULL));
   ESP_ERROR_CHECK(esp_event_handler_instance_register(
       IP_EVENT, IP_EVENT_AP_STAIPASSIGNED, wifi_event_handler, NULL, NULL));
 
+  // 4. Access Point Configuration
   wifi_config_t wifi_config = {
       .ap =
           {
-              // Public SSID visible to phone/browser client.
+              // The public SSID that phones and browsers will see when scanning for Wi-Fi.
               .ssid = WIFI_SSID,
               .ssid_len = sizeof(WIFI_SSID) - 1,
+              // WPA2 Password for the network.
               .password = WIFI_PASS,
-              // Allow a few concurrent clients for debugging.
+              // Restrict to 4 concurrent clients to conserve memory and bandwidth.
               .max_connection = 4,
+              // Use standard WPA2-PSK security.
               .authmode = WIFI_AUTH_WPA_WPA2_PSK,
+              // Broadcast on channel 1.
               .channel = 1,
           },
   };
+  
+  // Set the hardware strictly to Access Point mode (disable Station mode).
   ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
-  // Apply AP config to Wi-Fi interface.
+  
+  // Commit the configuration to the Wi-Fi driver.
   ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
+  
+  // Bring up the radio and start broadcasting the SSID.
   ESP_ERROR_CHECK(esp_wifi_start());
 
+  // Log successful startup. In AP mode, the ESP32's default gateway IP is always 192.168.4.1.
   ESP_LOGI(TAG, "WiFi AP started — SSID: %s  http://192.168.4.1", WIFI_SSID);
 }
 
@@ -150,7 +182,14 @@ void web_server_start(void) {
   // Larger stack for JSON parsing + signaling transforms.
   config.stack_size = 8192;
 
+  // Declare the server handle, initially NULL.
   httpd_handle_t server = NULL;
+  
+  // Start the HTTP server. 
+  // We pass the address of our handle (&server) as a double pointer. 
+  // The esp_http_server library internally allocates the memory for the new server 
+  // instance and writes the memory address back into our 'server' variable.
+  // If the function returns ESP_OK, 'server' will hold the valid, instantiated handle.
   if (httpd_start(&server, &config) != ESP_OK) {
     ESP_LOGE(TAG, "Failed to start HTTP server");
     return;

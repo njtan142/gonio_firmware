@@ -17,26 +17,46 @@
 static const char *TAG = "webrtc";
 #define ENABLE_WEBRTC_TRACE 1
 
+// ── WebRTC Global State & Synchronization Primitives ──────────────────────────
 // Shared PeerConnection + signaling state across HTTP handlers and RTOS tasks.
-static PeerConnection    *g_pc            = NULL;
-static SemaphoreHandle_t  g_pc_mutex      = NULL;
-static SemaphoreHandle_t  g_offer_lock    = NULL;
-static SemaphoreHandle_t  g_answer_ready  = NULL;
-// Temporary ownership handoff: callback writes this, API returns it to caller.
+// Note: 'g_' prefix denotes global variables shared across tasks.
+// 'pc' stands for PeerConnection, the core object representing the WebRTC session.
+static PeerConnection    *g_pc            = NULL;  // The active WebRTC peer connection object
+static SemaphoreHandle_t  g_pc_mutex      = NULL;  // Mutex to serialize access to the g_pc object across tasks
+// 'SDP' stands for Session Description Protocol, used to negotiate the WebRTC connection.
+static SemaphoreHandle_t  g_offer_lock    = NULL;  // Mutex to ensure only one SDP offer is processed at a time
+static SemaphoreHandle_t  g_answer_ready  = NULL;  // Binary semaphore used to block the HTTP handler until the SDP answer is generated
+
+// Temporary ownership handoff: The libpeer callback writes the generated SDP answer here,
+// and the HTTP handler reads it, sends it back to the client, and frees it.
 static char              *g_answer_sdp    = NULL;
-// Data-channel liveness flag used by both /api/status and streaming loop.
+
+// 'dc' stands for Data Channel, the WebRTC bidirectional data stream.
+// Data-channel liveness flag used by both /api/status (for polling) and the streaming loop (to know when to send)
 static volatile bool      g_dc_open       = false;
-// Last SoC value pushed from ui_task; encoded into outgoing telemetry frames.
+
+// 'soc_pct' stands for State of Charge (battery level) Percentage.
+// Last State of Charge value pushed from the INA219 ui_task.
+// It is read by the streaming loop to pack into the outgoing high-frequency telemetry frames.
 static volatile float     g_soc_pct            = 100.0f;
-// Batching parameters: fpp timesteps are packed into one DataChannel send.
-static volatile int       g_frames_per_packet  = 1;    // timesteps per send (1–46)
-static volatile int       g_packet_freq_hz     = 60;   // packet send rate (Hz, 10–400)
-// Send-loop gate toggled by control API and channel lifecycle callbacks.
+
+// ── WebRTC Transmission & Batching Controls ───────────────────────────────────
+// Batching parameters: 'fpp' (frames per packet) timesteps are aggregated before a single DataChannel send.
+// This greatly reduces DTLS (Datagram Transport Layer Security) and SCTP (Stream Control Transmission Protocol)
+// overhead at high sampling frequencies.
+static volatile int       g_frames_per_packet  = 1;    // Default: 1 timestep per send (max 46 due to MTU: Maximum Transmission Unit limit)
+// 'hz' stands for Hertz (cycles or packets per second).
+static volatile int       g_packet_freq_hz     = 60;   // Default: 60 network sends per second (10-400 Hz limit)
+
+// Send-loop gate toggled by the /api/control endpoint and channel lifecycle callbacks.
+// Allows the client to cleanly pause/resume the high-frequency telemetry stream.
 static volatile bool      g_stream_active = true;
-// Basic diagnostics counters for periodic trace logs.
-static uint32_t           g_tx_packets    = 0;
-static uint32_t           g_tx_bytes      = 0;
-static uint32_t           g_rx_messages   = 0;
+
+// Basic diagnostic counters used by the streaming_task to log periodic performance traces.
+// 'tx' stands for transmit, 'rx' stands for receive.
+static uint32_t           g_tx_packets    = 0;  // Total number of WebRTC data channel packets successfully sent
+static uint32_t           g_tx_bytes      = 0;  // Total number of payload bytes transmitted
+static uint32_t           g_rx_messages   = 0;  // Total number of inbound control messages received from the client
 
 /**
  * @brief Packs one sensor reading into the 8-byte binary telemetry frame.

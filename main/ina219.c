@@ -3,13 +3,14 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-#define I2C_NUM             I2C_NUM_0
-#define INA219_REG_CONFIG   0x00
-#define INA219_REG_SHUNT    0x01
-#define INA219_REG_BUS      0x02
-#define INA219_REG_POWER    0x03
-#define INA219_REG_CURRENT  0x04
-#define INA219_REG_CALIB    0x05
+// INA219 I2C Hardware and Register Map Configuration
+#define I2C_NUM             I2C_NUM_0 /*!< The ESP32 I2C hardware port used for communicating with the INA219. */
+#define INA219_REG_CONFIG   0x00      /*!< Configuration Register (0x00): Sets operating mode, bus/shunt ADC resolution, and PGA gain. */
+#define INA219_REG_SHUNT    0x01      /*!< Shunt Voltage Register (0x01): Contains the raw voltage measurement across the shunt resistor. */
+#define INA219_REG_BUS      0x02      /*!< Bus Voltage Register (0x02): Contains the raw voltage measurement of the load bus. */
+#define INA219_REG_POWER    0x03      /*!< Power Register (0x03): Contains the computed power value (Bus Voltage * Current). */
+#define INA219_REG_CURRENT  0x04      /*!< Current Register (0x04): Contains the computed current value flowing through the shunt resistor. */
+#define INA219_REG_CALIB    0x05      /*!< Calibration Register (0x05): Used to set the multiplier for the Current and Power math engines. */
 
 // current_lsb = 1mA, shunt = 0.1 ohm → cal = trunc(0.04096 / (0.001 * 0.1)) = 409
 // If your board has a 0.01 ohm shunt, use 4096 instead
