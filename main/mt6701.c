@@ -50,17 +50,26 @@ static const int k_cs_pins[MT6701_NUM_SENSORS] = {
 // Used for standard, non-fast-path polling transactions.
 static spi_device_handle_t s_devs[MT6701_NUM_SENSORS];
 
-// Caches the last successfully decoded floating-point angle (0-360°) for each sensor.
-// Returned as a fallback if a subsequent read fails CRC or physical probing.
+// Caches the last successfully decoded floating-point angle (0-360°) for each
+// sensor. Returned as a fallback if a subsequent read fails CRC or physical
+// probing.
 static float s_last_deg[MT6701_NUM_SENSORS];
 
 // Tracks whether each sensor electrically responded to probing at boot.
 // Missing sensors are skipped in the fast-path loop to prevent bus timeouts.
 static bool s_present[MT6701_NUM_SENSORS];
 
-// Latches any runtime faults for each sensor (e.g., CRC corruption or magnetic strength warnings).
-// Used by the WebRTC telemetry loop to tag invalid data frames.
+// Latches any runtime faults for each sensor (e.g., CRC corruption or magnetic
+// strength warnings). Used by the WebRTC telemetry loop to tag invalid data
+// frames.
 static bool s_error[MT6701_NUM_SENSORS];
+
+// Software mutual exclusion to completely suspend SPI transactions.
+static volatile bool s_paused = false;
+
+void mt6701_pause_spi(bool pause) {
+  s_paused = pause;
+}
 
 /* Snapshot of GPSPI2.misc.val captured during mt6701_acquire_bus() for each
  * sensor.  The snapshot encodes which CSn_dis bits are clear (i.e. which
@@ -123,19 +132,21 @@ static uint8_t crc6_compute(uint32_t data18) {
 static bool probe_sensor(int i) {
   ESP_LOGI(TAG, "probing sensor %d (CS GPIO %d) ...", i, k_cs_pins[i]);
   for (int t = 0; t < MT6701_PROBE_TRIES; t++) {
-    // We only care about receiving data. The MT6701 is an SSI (Synchronous Serial Interface) 
-    // device which essentially means it acts like a read-only SPI slave.
+    // We only care about receiving data. The MT6701 is an SSI (Synchronous
+    // Serial Interface) device which essentially means it acts like a read-only
+    // SPI slave.
     uint8_t rx[3] = {0};
-    
+
     // Configure the SPI transaction to clock out exactly 24 bits.
-    // Since we are not sending any commands to the sensor (MOSI is don't-care), 
-    // we only need to provide an rx_buffer to catch the 24 bits clocked in on MISO.
+    // Since we are not sending any commands to the sensor (MOSI is don't-care),
+    // we only need to provide an rx_buffer to catch the 24 bits clocked in on
+    // MISO.
     spi_transaction_t txn = {
         .length = 24,   // Total clock cycles to generate
         .rxlength = 24, // Total bits to capture into the rx_buffer
         .rx_buffer = rx,
     };
-    
+
     // Execute a synchronous (blocking) SPI transmission.
     if (spi_device_transmit(s_devs[i], &txn) != ESP_OK) {
       ESP_LOGW(TAG, "  [%d/%d] SPI transmit failed", t + 1, MT6701_PROBE_TRIES);
@@ -263,6 +274,10 @@ float mt6701_get_degrees(int sensor) {
   if (!s_present[sensor])
     return 0.0f;
 
+  // Mutual exclusion: return cached data immediately to yield SPI bus
+  if (s_paused)
+    return s_last_deg[sensor];
+
   uint8_t rx[3] = {0};
   spi_transaction_t t = {
       .length = 24, // clock out 24 bits; MOSI don't-care for read-only SSI
@@ -351,6 +366,11 @@ bool mt6701_has_error(int sensor) {
  * single-register write that takes a few nanoseconds.
  */
 void mt6701_acquire_bus(void) {
+  if (s_paused) {
+    s_fast_armed = false;
+    return;
+  }
+
   spi_device_acquire_bus(s_devs[0], portMAX_DELAY);
 
   /* Prime every present sensor in order, recording the hardware-CS config
@@ -409,6 +429,7 @@ void mt6701_acquire_bus(void) {
  * to see per-batch CRC/mag-warn counts.
  */
 void mt6701_release_bus(void) {
+  if (!s_fast_armed) return;
   s_fast_armed = false;
   /* Aggregate 1-second windows of fast-read stats so we don't spam the UART
    * once per 2.5 ms batch.  The acquisition task calls release_bus() every
@@ -469,6 +490,8 @@ float mt6701_get_degrees_fast(int sensor) {
     return 0.0f;
   if (!s_present[sensor])
     return 0.0f;
+  if (s_paused)
+    return s_last_deg[sensor];
   if (!s_fast_armed) {
     /* Misuse — fall back to the driver path so we still return a sane
      * value.  Log once; spamming here would tank performance. */

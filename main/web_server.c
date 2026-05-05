@@ -152,6 +152,13 @@ void wifi_init_softap(void) {
   // Bring up the radio and start broadcasting the SSID.
   ESP_ERROR_CHECK(esp_wifi_start());
 
+  // Reduce TX power from the default 20 dBm (80) to ~8.5 dBm (34).
+  // The unit is 0.25 dBm per step. 20 dBm is the factory default and the RF PA
+  // at that level is the primary heat source on the ESP32-C3 SuperMini's tiny LDO.
+  // 8.5 dBm is still adequate for a room-scale AP (~10m radius) and cuts RF heat significantly.
+  // Increase this value (max 80) if range becomes an issue.
+  esp_wifi_set_max_tx_power(34);
+
   // Log successful startup. In AP mode, the ESP32's default gateway IP is always 192.168.4.1.
   ESP_LOGI(TAG, "WiFi AP started — SSID: %s  http://192.168.4.1", WIFI_SSID);
 }

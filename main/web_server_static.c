@@ -8,6 +8,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
+#include "mt6701.h"
 
 static const char *TAG = "web_server_static";
 
@@ -163,7 +164,11 @@ static esp_err_t http_get_handler(httpd_req_t *req) {
     httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
 
   // 4. Stream the file content using chunked transfer encoding to keep memory usage low and constant.
+  // We completely pause the MT6701 sensors while the file streams to ensure zero SPI bus contention.
+  mt6701_pause_spi(true);
   stream_file_chunks(req, f);
+  mt6701_pause_spi(false);
+  
   fclose(f);
 
   ESP_LOGI(TAG, "Served: %s", filepath);

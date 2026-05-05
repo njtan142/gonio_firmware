@@ -50,3 +50,6 @@ void mt6701_release_bus(void);
 // All four sensors are supported — CS routing is restored from the per-sensor
 // snapshot captured during acquire_bus().
 float mt6701_get_degrees_fast(int sensor);
+
+// Mutually exclusive lock for shared SPI Flash operations
+void mt6701_pause_spi(bool pause);
