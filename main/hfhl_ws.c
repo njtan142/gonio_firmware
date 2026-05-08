@@ -17,6 +17,10 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 
+/* Set to 1 to enable per-batch logging of buffer saves and TCP sends.
+ * Warning: Printing these logs at 60Hz may spam the console. */
+#define ENABLE_VERBOSE_ACQ_LOGS 0
+
 static const char *TAG = "hfhl_ws";
 
 /* Battery SoC%, defined in main.c, updated by ui_task. */
@@ -58,86 +62,6 @@ static uint8_t          *s_send_buf     = NULL; /* WS_SEND_SAMPLES × RB_SAMPLE_
 static uint8_t          *s_compress_buf = NULL; /* 4096 bytes: v2 compressed output */
 static SemaphoreHandle_t s_send_sem; /* 1 = buffer free, 0 = send in flight */
 
-typedef struct {
-  httpd_handle_t server;
-  int fd;
-  size_t len;
-  uint8_t *data; /* points into s_compress_buf — NOT owned by this job */
-} ws_job_t;
-
-static void ws_send_cb(void *arg) {
-  // Cast the generic void pointer back to our specific websocket job structure
-  ws_job_t *job = (ws_job_t *)arg;
-  
-  // Construct the websocket frame. We send binary data (compressed batches) 
-  // as complete, unfragmented frames.
-  httpd_ws_frame_t frame = {
-      .final = true,
-      .fragmented = false,
-      .type = HTTPD_WS_TYPE_BINARY,
-      .payload = job->data,
-      .len = job->len,
-  };
-  
-  // Asynchronously dispatch the frame to the underlying socket.
-  // If this fails, it usually means the client abruptly disconnected.
-  if (httpd_ws_send_frame_async(job->server, job->fd, &frame) != ESP_OK) {
-    // Stop the high-frequency sensor acquisition task immediately
-    s_acq_run = false;
-    
-    // Clear the active client file descriptor so we know the socket is dead
-    s_client_fd = -1;
-    
-    // Free the ring buffer memory since no client is connected to consume it
-    rb_free();
-    
-    // Release the semaphore BEFORE freeing the buffers. This ensures that if
-    // ws_flush_task is blocked waiting on this semaphore, it will wake up
-    // and cleanly exit its processing loop when it notices the buffers are NULL.
-    xSemaphoreGive(s_send_sem);
-    
-    // Deallocate the temporary staging and compression buffers to save heap memory
-    free(s_send_buf);     s_send_buf     = NULL;
-    free(s_compress_buf); s_compress_buf = NULL;
-    
-    // Log the disconnection event
-    ESP_LOGW(TAG, "ws send failed — client fd=%d dropped", job->fd);
-    
-    // Free the memory allocated for the job argument itself
-    free(job);
-    return;
-  }
-  
-  // If the send succeeded, release the semaphore. This signals ws_flush_task 
-  // that the buffers are no longer in use by the HTTP server task and can be safely
-  // overwritten with the next batch of data.
-  xSemaphoreGive(s_send_sem); 
-  
-  // Free the memory allocated for the job argument
-  free(job);
-}
-
-/* ── FreeRTOS tasks ─────────────────────────────────────────────────────────
- *
- * sensor_acq_task  — high priority producer:
- *   Reads all 4 MT6701 sensors at s_acq_hz, packs one 32-byte sample, and
- *   pushes it into the ring buffer.  Runs whenever s_acq_run is true,
- *   regardless of whether a WebSocket client is connected.
- *
- * ws_flush_task — low priority consumer:
- *   Drains the ring buffer in FLUSH_BATCH-sample chunks and queues each chunk
- *   for delivery to the connected WebSocket client via httpd_queue_work.
- *   Sleeps when no client is connected or when the buffer is empty.
- */
-
-/* Decode the 14-bit angle from a sensor slot within a packed 32-byte sample. */
-static float decode_angle(const uint8_t *sample, int sensor) {
-  const uint8_t *b = sample + sensor * 8;
-  uint64_t frame = 0;
-  for (int i = 0; i < 8; i++) frame = (frame << 8) | b[i];
-  uint16_t raw = (uint16_t)((frame >> 50) & 0x3FFF);
-  return raw * (360.0f / 16384.0f);
-}
 
 /* ── v2 batch compression ────────────────────────────────────────────────────
  * Wire format (v2):
@@ -241,8 +165,7 @@ static void ws_flush_task(void *pv) {
       goto maybe_log;
     }
 
-    /* Wait for the previous send to finish before refilling s_send_buf.
-     * ws_send_cb gives this semaphore after the TCP send completes. */
+    /* Wait for the previous send to finish before refilling s_send_buf. */
     xSemaphoreTake(s_send_sem, portMAX_DELAY);
 
     fd = s_client_fd; /* re-check after potentially sleeping on semaphore */
@@ -267,37 +190,33 @@ static void ws_flush_task(void *pv) {
 
     int compressed_len = compress_batch(s_send_buf, popped, s_compress_buf);
 
-    ws_job_t *job = malloc(sizeof(ws_job_t)); /* tiny header only — always succeeds */
-    if (!job) {
-      xSemaphoreGive(s_send_sem);
-      vTaskDelay(pdMS_TO_TICKS(100));
-      goto maybe_log;
-    }
-    job->server  = s_server;
-    job->fd      = fd;
-    job->data    = s_compress_buf;
-    job->len     = (size_t)compressed_len;
-    size_t bytes = job->len; /* snapshot before hand-off — ws_send_cb frees job */
+    httpd_ws_frame_t frame = {
+        .type     = HTTPD_WS_TYPE_BINARY,
+        .payload  = s_compress_buf,
+        .len      = (size_t)compressed_len,
+        .final    = true,
+    };
 
-#if ENABLE_WS_DATA_TRACE
-    ESP_LOGI(TAG, "flush n=%d  s0=%.2f° s1=%.2f° s2=%.2f° s3=%.2f°",
-             popped,
-             decode_angle(s_send_buf, 0),
-             decode_angle(s_send_buf, 1),
-             decode_angle(s_send_buf, 2),
-             decode_angle(s_send_buf, 3));
+#if ENABLE_VERBOSE_ACQ_LOGS
+    ESP_LOGI(TAG, "ws_flush_task: calling send_frame_async (fd=%d, len=%d)...", fd, compressed_len);
 #endif
-
-    if (httpd_queue_work(s_server, ws_send_cb, job) != ESP_OK) {
-      /* Queue full — give semaphore back (buffer not in use) and back off. */
-      free(job);
-      xSemaphoreGive(s_send_sem);
-      stat_qfails++;
-      vTaskDelay(pdMS_TO_TICKS(15));
+    if (httpd_ws_send_frame_async(s_server, fd, &frame) != ESP_OK) {
+        ESP_LOGW(TAG, "send_frame_async failed, setting s_acq_run=false");
+        s_acq_run = false;
+        s_client_fd = -1;
+        rb_free();
+        ESP_LOGW(TAG, "ws send failed — client fd=%d dropped", fd);
+        xSemaphoreGive(s_send_sem);
+        
+        free(s_send_buf);     s_send_buf     = NULL;
+        free(s_compress_buf); s_compress_buf = NULL;
     } else {
-      stat_samples += (uint32_t)popped;
-      stat_bytes   += (uint32_t)bytes;
-      /* semaphore is now held by the in-flight ws_send_cb */
+#if ENABLE_VERBOSE_ACQ_LOGS
+        ESP_LOGI(TAG, "ws_flush_task: TCP send of %d samples (%d bytes) successful!", popped, compressed_len);
+#endif
+        stat_samples += (uint32_t)popped;
+        stat_bytes   += (uint32_t)compressed_len;
+        xSemaphoreGive(s_send_sem);
     }
 
 maybe_log:
@@ -373,6 +292,9 @@ static void sensor_acq_task(void *pv) {
       rb_push(sample);
       stat_produced++;
     }
+#if ENABLE_VERBOSE_ACQ_LOGS
+    ESP_LOGI(TAG, "sensor_acq_task: saved %d samples to buffer (rb_count=%d)", fpp, rb_count());
+#endif
     mt6701_release_bus();
 
     /* Wait for the next batch period.  On single-core ESP32-C3,

@@ -10,12 +10,12 @@
 //
 // Sensor → joint mapping (default gait configuration):
 //   0  GPIO  0  Knee  — Central Node, always wired
-//   1  GPIO  1  Hip yaw
-//   2  GPIO  2  Hip pitch
-//   3  GPIO 10  Ankle yaw
-#define MT6701_CS0_IO  0
-#define MT6701_CS1_IO  1
-#define MT6701_CS2_IO  2
+//   1  GPIO  2  Hip yaw
+//   2  GPIO  1  Hip pitch
+//   3  GPIO 10  Ankle pitch
+#define MT6701_CS0_IO 0
+#define MT6701_CS1_IO 2
+#define MT6701_CS2_IO 1
 #define MT6701_CS3_IO 10
 
 // Must be called after ext_flash_init() (which initialises the SPI2 bus).
@@ -50,6 +50,3 @@ void mt6701_release_bus(void);
 // All four sensors are supported — CS routing is restored from the per-sensor
 // snapshot captured during acquire_bus().
 float mt6701_get_degrees_fast(int sensor);
-
-// Mutually exclusive lock for shared SPI Flash operations
-void mt6701_pause_spi(bool pause);

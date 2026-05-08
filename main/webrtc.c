@@ -369,15 +369,18 @@ esp_err_t webrtc_handle_offer(const char *offer_sdp, char **answer_out) {
     setup_callbacks();
     /* Setting remote description triggers answer generation; ICE gathering
        is driven by peer_main_task calling peer_connection_loop(). */
+    ESP_LOGI(TAG, "webrtc_handle_offer: calling peer_connection_set_remote_description");
     peer_connection_set_remote_description(g_pc, offer_sdp);
     xSemaphoreGive(g_pc_mutex);
 
+    ESP_LOGI(TAG, "webrtc_handle_offer: waiting for g_answer_ready (8 seconds max)...");
     /* Wait for on_local_description to fire (host candidates only — fast) */
     if (xSemaphoreTake(g_answer_ready, pdMS_TO_TICKS(8000)) != pdTRUE) {
-        ESP_LOGE(TAG, "timed out waiting for local description");
+        ESP_LOGE(TAG, "webrtc_handle_offer: TIMED OUT waiting for local description!");
         xSemaphoreGive(g_offer_lock);
         return ESP_ERR_TIMEOUT;
     }
+    ESP_LOGI(TAG, "webrtc_handle_offer: g_answer_ready received!");
 
     xSemaphoreGive(g_offer_lock);
 

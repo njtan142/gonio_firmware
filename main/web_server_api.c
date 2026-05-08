@@ -10,6 +10,7 @@
 #include "esp_log.h"
 #include "webrtc.h"
 #include "hfhl_ws.h"
+#include "nvs.h"
 #include <arpa/inet.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -920,20 +921,230 @@ static esp_err_t api_stop_handler(httpd_req_t *req) {
   return ESP_OK;
 }
 
+// NVS namespace and key prefix used for persisting zero offsets.
+#define NVS_NAMESPACE   "gonio"
+// Joint IDs known to the browser — also used as NVS keys (max 15 chars each).
+static const char *const k_joint_ids[] = {
+    "knee-central", "hip-yaw", "hip-pitch", "ankle-pitch"
+};
+#define NUM_JOINTS (sizeof(k_joint_ids) / sizeof(k_joint_ids[0]))
+
+float g_zero_offsets[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+float g_scale_factors[4]  = {1.0f, 1.0f, 1.0f, 1.0f};
+sensor_lut_t g_luts[4] = {0};
+
+void web_server_api_init(void) {
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
+        for (int i = 0; i < NUM_JOINTS; i++) {
+            uint32_t bits = 0;
+            if (nvs_get_u32(h, k_joint_ids[i], &bits) == ESP_OK) {
+                memcpy(&g_zero_offsets[i], &bits, sizeof(float));
+            }
+            char scale_key[16];
+            snprintf(scale_key, sizeof(scale_key), "%s-s", k_joint_ids[i]);
+            bits = 0;
+            if (nvs_get_u32(h, scale_key, &bits) == ESP_OK) {
+                memcpy(&g_scale_factors[i], &bits, sizeof(float));
+            }
+            char lut_key[16];
+            snprintf(lut_key, sizeof(lut_key), "%s-l", k_joint_ids[i]);
+            size_t lut_size = sizeof(sensor_lut_t);
+            if (nvs_get_blob(h, lut_key, &g_luts[i], &lut_size) != ESP_OK) {
+                g_luts[i].num_points = 0;
+            }
+        }
+        nvs_close(h);
+    }
+}
+
 /**
- * @brief Reserved endpoint stub — zero-offset calibration is handled client-side.
+ * @brief Loads per-joint zero offsets from NVS and serializes them as JSON.
  *
- * Endpoint: `POST /api/zero`
- * Zero offsets are pure display math applied in the browser; the firmware
- * streams raw absolute angles and does not participate in calibration.
+ * Missing keys (first boot / never zeroed) are treated as 0.0.
+ *
+ * @param[out] out_json  Caller-allocated buffer to receive the JSON string.
+ * @param       out_len  Size of the buffer.
+ */
+static void load_offsets_json(char *out_json, size_t out_len) {
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &h);
+
+    cJSON *root    = cJSON_CreateObject();
+    cJSON *offsets = cJSON_CreateObject();
+    cJSON *scales  = cJSON_CreateObject();
+    cJSON *luts    = cJSON_CreateObject();
+    cJSON_AddItemToObject(root, "offsets", offsets);
+    cJSON_AddItemToObject(root, "scales", scales);
+    cJSON_AddItemToObject(root, "luts", luts);
+
+    for (size_t i = 0; i < NUM_JOINTS; i++) {
+        float val_offset = 0.0f;
+        float val_scale  = 1.0f;
+        sensor_lut_t lut = {0};
+        if (err == ESP_OK) {
+            uint32_t bits = 0;
+            if (nvs_get_u32(h, k_joint_ids[i], &bits) == ESP_OK) {
+                memcpy(&val_offset, &bits, sizeof(val_offset));
+            }
+            char scale_key[16];
+            snprintf(scale_key, sizeof(scale_key), "%s-s", k_joint_ids[i]);
+            bits = 0;
+            if (nvs_get_u32(h, scale_key, &bits) == ESP_OK) {
+                memcpy(&val_scale, &bits, sizeof(val_scale));
+            }
+            char lut_key[16];
+            snprintf(lut_key, sizeof(lut_key), "%s-l", k_joint_ids[i]);
+            size_t lut_size = sizeof(sensor_lut_t);
+            if (nvs_get_blob(h, lut_key, &lut, &lut_size) != ESP_OK) {
+                lut.num_points = 0;
+            }
+        }
+        cJSON_AddNumberToObject(offsets, k_joint_ids[i], (double)val_offset);
+        cJSON_AddNumberToObject(scales, k_joint_ids[i], (double)val_scale);
+        
+        cJSON *lut_arr = cJSON_CreateArray();
+        for (int p = 0; p < lut.num_points; p++) {
+            cJSON *pt = cJSON_CreateObject();
+            cJSON_AddNumberToObject(pt, "r", (double)lut.points[p].raw);
+            cJSON_AddNumberToObject(pt, "p", (double)lut.points[p].physical);
+            cJSON_AddItemToArray(lut_arr, pt);
+        }
+        cJSON_AddItemToObject(luts, k_joint_ids[i], lut_arr);
+    }
+
+    if (err == ESP_OK) nvs_close(h);
+
+    char *str = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (str) {
+        strlcpy(out_json, str, out_len);
+        free(str);
+    } else {
+        strlcpy(out_json, "{\"offsets\":{}}", out_len);
+    }
+}
+
+/**
+ * @brief GET /api/zero — returns the saved per-joint zero offsets as JSON.
+ *
+ * Response: `{"offsets":{"knee-central":0.0,"hip-yaw":0.0,...}}`
  *
  * @param req The HTTP request handle.
  * @return ESP_OK
  */
-static esp_err_t api_zero_handler(httpd_req_t *req) {
-  set_cors_headers(req);
-  send_json_ok(req);
-  return ESP_OK;
+static esp_err_t api_zero_get_handler(httpd_req_t *req) {
+    set_cors_headers(req);
+    httpd_resp_set_type(req, "application/json");
+
+    char json[256];
+    load_offsets_json(json, sizeof(json));
+    httpd_resp_sendstr(req, json);
+    return ESP_OK;
+}
+
+/**
+ * @brief POST /api/zero — saves per-joint zero offsets to NVS.
+ *
+ * Expected payload: `{"offsets":{"knee-central":12.3,"hip-yaw":0.0,...}}`
+ * Unknown joint keys are silently ignored.
+ * On success responds with the full saved offset map.
+ *
+ * @param req The HTTP request handle.
+ * @return ESP_OK
+ */
+static esp_err_t api_zero_post_handler(httpd_req_t *req) {
+    set_cors_headers(req);
+
+    cJSON *root = NULL;
+    if (parse_json_body(req, &root) != ESP_OK) return ESP_FAIL;
+
+    cJSON *offsets = cJSON_GetObjectItemCaseSensitive(root, "offsets");
+    cJSON *scales  = cJSON_GetObjectItemCaseSensitive(root, "scales");
+    cJSON *luts    = cJSON_GetObjectItemCaseSensitive(root, "luts");
+    if (!cJSON_IsObject(offsets) && !cJSON_IsObject(scales) && !cJSON_IsObject(luts)) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing offsets, scales, or luts object");
+        return ESP_FAIL;
+    }
+
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        cJSON_Delete(root);
+        ESP_LOGE(TAG, "nvs_open failed: %s", esp_err_to_name(err));
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "NVS open failed");
+        return ESP_FAIL;
+    }
+
+    for (size_t i = 0; i < NUM_JOINTS; i++) {
+        if (cJSON_IsObject(offsets)) {
+            cJSON *item = cJSON_GetObjectItemCaseSensitive(offsets, k_joint_ids[i]);
+            if (cJSON_IsNumber(item)) {
+                float val = (float)item->valuedouble;
+                g_zero_offsets[i] = val; // Synchronize with OLED cache
+                uint32_t bits;
+                memcpy(&bits, &val, sizeof(bits));
+                err = nvs_set_u32(h, k_joint_ids[i], bits);
+                if (err != ESP_OK) {
+                    ESP_LOGW(TAG, "nvs_set_u32(%s) failed: %s", k_joint_ids[i], esp_err_to_name(err));
+                }
+            }
+        }
+        if (cJSON_IsObject(scales)) {
+            cJSON *item = cJSON_GetObjectItemCaseSensitive(scales, k_joint_ids[i]);
+            if (cJSON_IsNumber(item)) {
+                float val = (float)item->valuedouble;
+                g_scale_factors[i] = val; // Synchronize with OLED cache
+                uint32_t bits;
+                memcpy(&bits, &val, sizeof(bits));
+                char scale_key[16];
+                snprintf(scale_key, sizeof(scale_key), "%s-s", k_joint_ids[i]);
+                err = nvs_set_u32(h, scale_key, bits);
+                if (err != ESP_OK) {
+                    ESP_LOGW(TAG, "nvs_set_u32(%s) failed: %s", scale_key, esp_err_to_name(err));
+                }
+            }
+        }
+        if (cJSON_IsObject(luts)) {
+            cJSON *item = cJSON_GetObjectItemCaseSensitive(luts, k_joint_ids[i]);
+            if (cJSON_IsArray(item)) {
+                sensor_lut_t lut = {0};
+                int p = 0;
+                cJSON *pt;
+                cJSON_ArrayForEach(pt, item) {
+                    if (p >= MAX_LUT_POINTS) break;
+                    cJSON *r = cJSON_GetObjectItemCaseSensitive(pt, "r");
+                    cJSON *ph = cJSON_GetObjectItemCaseSensitive(pt, "p");
+                    if (cJSON_IsNumber(r) && cJSON_IsNumber(ph)) {
+                        lut.points[p].raw = (float)r->valuedouble;
+                        lut.points[p].physical = (float)ph->valuedouble;
+                        p++;
+                    }
+                }
+                lut.num_points = p;
+                g_luts[i] = lut; // Synchronize with OLED cache
+                char lut_key[16];
+                snprintf(lut_key, sizeof(lut_key), "%s-l", k_joint_ids[i]);
+                err = nvs_set_blob(h, lut_key, &lut, sizeof(sensor_lut_t));
+                if (err != ESP_OK) {
+                    ESP_LOGW(TAG, "nvs_set_blob(%s) failed: %s", lut_key, esp_err_to_name(err));
+                }
+            }
+        }
+    }
+    nvs_commit(h);
+    nvs_close(h);
+    cJSON_Delete(root);
+
+    ESP_LOGI(TAG, "Zero offsets saved to NVS");
+
+    // Echo back the saved state so the browser can confirm.
+    httpd_resp_set_type(req, "application/json");
+    char json[256];
+    load_offsets_json(json, sizeof(json));
+    httpd_resp_sendstr(req, json);
+    return ESP_OK;
 }
 
 /**
@@ -949,15 +1160,17 @@ void web_server_register_api_routes(httpd_handle_t server) {
   /* API endpoints are explicit and should win over static file fallback. */
   httpd_uri_t routes[] = {
       // Status polled by UI for connection/stream readiness hints.
-      {.uri = "/api/status", .method = HTTP_GET, .handler = api_status_handler},
+      {.uri = "/api/status", .method = HTTP_GET,  .handler = api_status_handler},
       // SDP offer/answer exchange.
-      {.uri = "/api/offer", .method = HTTP_POST, .handler = api_offer_handler},
+      {.uri = "/api/offer",  .method = HTTP_POST, .handler = api_offer_handler},
       // Trickle ICE candidate ingestion.
-      {.uri = "/api/ice", .method = HTTP_POST, .handler = api_ice_handler},
+      {.uri = "/api/ice",    .method = HTTP_POST, .handler = api_ice_handler},
       // Runtime control endpoints.
-      {.uri = "/api/start", .method = HTTP_POST, .handler = api_start_handler},
-      {.uri = "/api/stop", .method = HTTP_POST, .handler = api_stop_handler},
-      {.uri = "/api/zero", .method = HTTP_POST, .handler = api_zero_handler},
+      {.uri = "/api/start",  .method = HTTP_POST, .handler = api_start_handler},
+      {.uri = "/api/stop",   .method = HTTP_POST, .handler = api_stop_handler},
+      // Zero-offset calibration persistence (GET = load, POST = save).
+      {.uri = "/api/zero",   .method = HTTP_GET,  .handler = api_zero_get_handler},
+      {.uri = "/api/zero",   .method = HTTP_POST, .handler = api_zero_post_handler},
   };
   // Register each route with ESP-IDF HTTP server.
   for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); i++) {

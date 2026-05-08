@@ -18,6 +18,7 @@
 #include "ssd1306_util.h"
 #include "web_server.h"
 #include "webrtc.h"
+#include "esp_spiffs.h"
 
 const char *TAG = "system";
 
@@ -124,7 +125,7 @@ void app_main(void) {
     webrtc_init();
   }
 #else
-  ESP_LOGI(BOOT_TAG, "Bypassing external flash to test MT6701...");
+  ESP_LOGI(BOOT_TAG, "Using internal flash for web assets...");
   
   // Initialize SPI2 bus directly since we bypassed ext_flash_init
   spi_bus_config_t bus_cfg = {
@@ -136,7 +137,21 @@ void app_main(void) {
   };
   spi_bus_initialize(SPI2_HOST, &bus_cfg, SPI_DMA_CH_AUTO);
 
-  // We are not starting the web server since there is no flash memory
+  // Mount internal SPIFFS
+  esp_vfs_spiffs_conf_t spiffs_cfg = {
+      .base_path = "/spiffs",
+      .partition_label = "spiffs", // from partitions.csv
+      .max_files = 10,
+      .format_if_mount_failed = false,
+  };
+  esp_err_t spiffs_ret = esp_vfs_spiffs_register(&spiffs_cfg);
+  if (spiffs_ret != ESP_OK) {
+      ESP_LOGE(BOOT_TAG, "Failed to mount internal SPIFFS (%s)", esp_err_to_name(spiffs_ret));
+  } else {
+      ESP_LOGI(BOOT_TAG, "Internal SPIFFS mounted successfully");
+      web_server_start();
+  }
+
   // Start the sensors directly!
   mt6701_init();
   webrtc_init();
@@ -146,8 +161,12 @@ void app_main(void) {
   counter_mutex = xSemaphoreCreateMutex();
   i2c_mutex = xSemaphoreCreateMutex();
 
-  // coulomb_task at higher priority so sampling isn't starved by display work
-  xTaskCreate(coulomb_task, "coulomb", 2048, NULL, 5, NULL);
-  xTaskCreate(ui_task, "ui", 3072, NULL, 4, NULL);
+  // coulomb_task at higher priority so sampling isn't starved by display work.
+  // display_task at lower priority — runs at 20 Hz and can yield freely.
+  // NOTE: 4096-byte stack for display_task — snprintf("%5.1f") calls _dtoa_r
+  //       which alone needs ~1.5 KB; 2048 is not enough and causes a stack fault.
+  xTaskCreate(coulomb_task,  "coulomb", 2048, NULL, 5, NULL);
+  xTaskCreate(ui_task,       "ui",      3072, NULL, 4, NULL);
+  xTaskCreate(display_task,  "display", 4096, NULL, 3, NULL);
 }
 

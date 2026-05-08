@@ -64,13 +64,6 @@ static bool s_present[MT6701_NUM_SENSORS];
 // frames.
 static bool s_error[MT6701_NUM_SENSORS];
 
-// Software mutual exclusion to completely suspend SPI transactions.
-static volatile bool s_paused = false;
-
-void mt6701_pause_spi(bool pause) {
-  s_paused = pause;
-}
-
 /* Snapshot of GPSPI2.misc.val captured during mt6701_acquire_bus() for each
  * sensor.  The snapshot encodes which CSn_dis bits are clear (i.e. which
  * hardware CS signal is routed to the GPIO matrix for that sensor) so the
@@ -274,10 +267,6 @@ float mt6701_get_degrees(int sensor) {
   if (!s_present[sensor])
     return 0.0f;
 
-  // Mutual exclusion: return cached data immediately to yield SPI bus
-  if (s_paused)
-    return s_last_deg[sensor];
-
   uint8_t rx[3] = {0};
   spi_transaction_t t = {
       .length = 24, // clock out 24 bits; MOSI don't-care for read-only SSI
@@ -366,37 +355,74 @@ bool mt6701_has_error(int sensor) {
  * single-register write that takes a few nanoseconds.
  */
 void mt6701_acquire_bus(void) {
-  if (s_paused) {
-    s_fast_armed = false;
-    return;
-  }
-
-  spi_device_acquire_bus(s_devs[0], portMAX_DELAY);
-
   /* Prime every present sensor in order, recording the hardware-CS config
    * the driver ends up with each time.  Absent sensors are skipped — their
-   * snapshot stays zero and get_degrees_fast() short-circuits on them. */
+   * snapshot stays zero and get_degrees_fast() short-circuits on them.
+   *
+   * IMPORTANT: sensor 0 is primed TWICE — once in the loop and once again
+   * at the end, just before the global bus lock.  When a higher-indexed
+   * sensor (e.g. sensor 3 / ankle-yaw) is the last one primed in the loop,
+   * the subsequent spi_device_release_bus() + spi_device_acquire_bus(s_devs[0])
+   * sequence may reprogram the GPIO matrix / GPSPI2.misc for sensor 0 via
+   * the ESP-IDF bus arbitration path, corrupting what the fast-path expects.
+   * Re-priming sensor 0 last guarantees s_misc_snapshot[0] is fresh and that
+   * GPSPI2 is already in sensor-0's CS state when the global lock is held. */
   uint8_t rx[3] = {0};
   spi_transaction_t prime = {.length = 24, .rxlength = 24, .rx_buffer = rx};
   for (int i = 0; i < MT6701_NUM_SENSORS; i++) {
     if (!s_present[i])
       continue;
-    /* polling_transmit runs spi_hal_setup_device(), which calls
-     * spi_ll_master_select_cs() → writes GPSPI2.misc appropriately. */
+    
+    /* We MUST acquire the bus for the specific device being transmitted on,
+     * otherwise ESP-IDF will deadlock if another device holds the lock. */
+    spi_device_acquire_bus(s_devs[i], portMAX_DELAY);
     esp_err_t err = spi_device_polling_transmit(s_devs[i], &prime);
+    
+    if (err == ESP_OK) {
+      /* Read the CS configuration while we still hold the bus */
+      s_misc_snapshot[i] = GPSPI2.misc.val;
+    }
+    
+    spi_device_release_bus(s_devs[i]);
+    
     if (err != ESP_OK) {
       ESP_LOGW(TAG, "acquire_bus: sensor %d prime failed: %s", i,
                esp_err_to_name(err));
       s_misc_snapshot[i] = 0;
       continue;
     }
-    s_misc_snapshot[i] = GPSPI2.misc.val;
     ESP_LOGD(TAG, "acquire_bus: sensor %d misc=0x%08lx (cs_dis=%c%c%c%c%c%c)",
              i, (unsigned long)s_misc_snapshot[i],
              GPSPI2.misc.cs0_dis ? '1' : '0', GPSPI2.misc.cs1_dis ? '1' : '0',
              GPSPI2.misc.cs2_dis ? '1' : '0', GPSPI2.misc.cs3_dis ? '1' : '0',
              GPSPI2.misc.cs4_dis ? '1' : '0', GPSPI2.misc.cs5_dis ? '1' : '0');
   }
+
+  /* Re-prime sensor 0 last so the hardware is in sensor-0's CS state when
+   * we acquire the global bus lock below.  Without this, the global acquire
+   * (which calls no spi_hal_setup_device) leaves GPSPI2 configured for
+   * whichever sensor was primed last in the loop — previously sensor 2
+   * (harmless, all sensors share mode/clock), but now sensor 3 whose
+   * spi_device_release_bus can clobber the GPIO matrix routing for CS0. */
+  if (s_present[0]) {
+    spi_device_acquire_bus(s_devs[0], portMAX_DELAY);
+    esp_err_t err = spi_device_polling_transmit(s_devs[0], &prime);
+    if (err == ESP_OK) {
+      s_misc_snapshot[0] = GPSPI2.misc.val;
+      ESP_LOGD(TAG, "acquire_bus: sensor 0 re-prime misc=0x%08lx",
+               (unsigned long)s_misc_snapshot[0]);
+    } else {
+      ESP_LOGW(TAG, "acquire_bus: sensor 0 re-prime failed: %s",
+               esp_err_to_name(err));
+    }
+    /* Do NOT release — transition directly into the global hold below. */
+  } else {
+    /* Sensor 0 absent: acquire globally so release_bus() can release. */
+    spi_device_acquire_bus(s_devs[0], portMAX_DELAY);
+  }
+
+  /* Bus is now globally locked via s_devs[0].  Other FreeRTOS tasks
+   * (ext_flash/VFS) cannot reclaim it until release_bus() is called. */
 
   /* CRITICAL: the SPI2 bus is DMA-enabled (ext_flash_init() passed
    * SPI_DMA_CH_AUTO).  After the priming read, GPSPI2.dma_conf.dma_rx_ena
@@ -416,6 +442,8 @@ void mt6701_acquire_bus(void) {
    * may still hold junk from the priming transfer. */
   GPSPI2.dma_conf.rx_afifo_rst = 1;
   GPSPI2.dma_conf.buf_afifo_rst = 1;
+  GPSPI2.dma_conf.rx_afifo_rst = 0;
+  GPSPI2.dma_conf.buf_afifo_rst = 0;
 
   s_fast_armed = true;
 }
@@ -490,8 +518,6 @@ float mt6701_get_degrees_fast(int sensor) {
     return 0.0f;
   if (!s_present[sensor])
     return 0.0f;
-  if (s_paused)
-    return s_last_deg[sensor];
   if (!s_fast_armed) {
     /* Misuse — fall back to the driver path so we still return a sane
      * value.  Log once; spamming here would tank performance. */
@@ -544,11 +570,14 @@ float mt6701_get_degrees_fast(int sensor) {
   }
   GPSPI2.data_buf[0] = 0; /* MOSI payload — don't-care */
   GPSPI2.cmd.update = 1;  /* latch user/ms_dlen into shadow regs */
+  // ESP_LOGV(TAG, "mt6701_get_degrees_fast: update latch");
   while (GPSPI2.cmd.update)
     ;
   GPSPI2.cmd.usr = 1;
+  // ESP_LOGV(TAG, "mt6701_get_degrees_fast: usr set");
   while (GPSPI2.cmd.usr)
     ; /* busy-poll — completes in ~6 µs at 4 MHz */
+  // ESP_LOGV(TAG, "mt6701_get_degrees_fast: transaction complete");
 
   /* data_buf[0] stores received bytes little-endian: first received byte at
    * bits [7:0].  MT6701 sends MSByte first → reconstruct as big-endian 24-bit.
@@ -559,7 +588,7 @@ float mt6701_get_degrees_fast(int sensor) {
 
   uint8_t crc_recv = raw & CRC_MASK;
   uint8_t crc_calc = crc6_compute(raw >> STATUS_SHIFT);
-  if (crc_calc != crc_recv) {
+  if (crc_calc != crc_recv || raw == 0x000000 || raw == 0xFFFFFF) {
     s_fast_crc_fail[sensor]++;
     /* Verbose-only: one line per failure would flood the UART at 60 Hz.
      * Promote to WARN if every read for this sensor is failing. */

@@ -203,6 +203,7 @@ void web_server_start(void) {
   }
 
   // API endpoints are registered first so they are not shadowed by 404 fallback.
+  web_server_api_init();
   web_server_register_api_routes(server);
   // HFHL WebSocket endpoint must be registered before the static wildcard handler.
   hfhl_ws_init(server);

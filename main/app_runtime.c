@@ -10,9 +10,13 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "hfhl_ws.h"
 #include "ina219.h"
+#include "mt6701.h"
 #include "ssd1306_util.h"
+#include "web_server_api.h"
 #include "webrtc.h"
+#include <math.h>
 
 extern const char *TAG;
 extern double total_amp_seconds;
@@ -88,10 +92,11 @@ void coulomb_task(void *pv) {
 }
 
 /**
- * @brief FreeRTOS task for UI and telemetry updates.
+ * @brief FreeRTOS task for SoC accounting and WebRTC telemetry.
  *
- * Runs every 1s. Computes mAh consumed in the last second and updates the OLED display
- * and WebRTC telemetry.
+ * Runs every 1s. Computes mAh consumed in the last second, updates the global
+ * soc_percent, and notifies WebRTC. Does NOT touch the OLED — that is handled
+ * by display_task at a higher rate.
  *
  * @param pv Task parameter (unused).
  */
@@ -136,23 +141,114 @@ void ui_task(void *pv) {
              current_ma, mah_per_sec);
  #endif
 
+  }
+}
+
+/**
+ * @brief FreeRTOS task for high-rate OLED display updates.
+ *
+ * Runs at 20 Hz (every 50 ms). Reads sensor angles over SPI (no I2C load),
+ * snapshots soc_percent under a brief mutex, then renders the full screen in
+ * a single I2C burst. Completely decoupled from the 1 Hz SoC accounting.
+ *
+ * @param pv Task parameter (unused).
+ */
+static float apply_lut(float raw, const sensor_lut_t *lut) {
+    if (lut->num_points == 0) return raw;
+    if (lut->num_points == 1) return raw - lut->points[0].raw + lut->points[0].physical;
+
+    int n = lut->num_points;
+    for (int i = 0; i < n; i++) {
+        int next = (i + 1) % n;
+        float r0 = lut->points[i].raw;
+        float r1 = lut->points[next].raw;
+        
+        float dr = r1 - r0;
+        while (dr < 0.0f) dr += 360.0f;
+        while (dr >= 360.0f) dr -= 360.0f;
+        
+        float d_raw = raw - r0;
+        while (d_raw < 0.0f) d_raw += 360.0f;
+        while (d_raw >= 360.0f) d_raw -= 360.0f;
+        
+        if (d_raw <= dr || n == 2) { 
+            if (dr == 0.0f) return lut->points[i].physical;
+            float t = d_raw / dr;
+            float p0 = lut->points[i].physical;
+            const float p1 = lut->points[next].physical;
+            float dp = p1 - p0;
+            // Choose the dp that is closest to the raw distance dr to ensure
+            // a consistent rotation direction and prevent 'flipping' at the wrap.
+            while (dp - dr < -180.0f) dp += 360.0f;
+            while (dp - dr > 180.0f) dp -= 360.0f;
+            float phys = p0 + t * dp;
+            while (phys < 0.0f) phys += 360.0f;
+            while (phys >= 360.0f) phys -= 360.0f;
+            return phys;
+        }
+    }
+    return raw;
+}
+
+void display_task(void *pv) {
 #if ENABLE_DISPLAY
-    // Keep the display update as one critical section to avoid interleaved
-    // transactions with other I2C users.
+  char line[32];
+
+  while (1) {
+    // 20 Hz — fast enough to feel live, but well within the ~12 ms I2C flush budget.
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    // Determine device state from connection flags (atomic bool reads, no mutex needed).
+    const char *state_str;
+    if (hfhl_ws_is_connected()) {
+        state_str = "HFHL";
+    } else if (webrtc_is_connected()) {
+        state_str = "LFLL";
+    } else {
+        state_str = "IDLE";
+    }
+
+    // Read all 4 sensor angles via SPI, apply LUT, then zero offsets and scale factors.
+    float ang[MT6701_NUM_SENSORS];
+    for (int s = 0; s < MT6701_NUM_SENSORS; s++) {
+        float raw = mt6701_get_degrees(s);
+        float calibrated = apply_lut(raw, &g_luts[s]);
+        float zeroed = (calibrated - g_zero_offsets[s]) * g_scale_factors[s];
+        // Wrap to [0, 360)
+        zeroed = fmodf(zeroed, 360.0f);
+        if (zeroed < 0.0f) zeroed += 360.0f;
+        ang[s] = zeroed;
+    }
+
+    // Snapshot soc_percent under the counter mutex (brief, non-blocking).
+    xSemaphoreTake(counter_mutex, portMAX_DELAY);
+    float soc_snap = soc_percent;
+    xSemaphoreGive(counter_mutex);
+
+    // Acquire I2C bus and flush the full frame in one critical section.
     xSemaphoreTake(i2c_mutex, portMAX_DELAY);
     ssd1306_clear_buffer();
 
-    snprintf(line, sizeof(line), "%.2fV   SoC:%.0f%%", voltage, soc_percent);
+    // Row 0: Knee (S0) and Hip-Yaw (S1) angles
+    snprintf(line, sizeof(line), "K:%5.1f H:%5.1f", ang[0], ang[1]);
     ssd1306_set_text(0, 0, line);
 
-    snprintf(line, sizeof(line), "%.4f mAh/s", mah_per_sec);
+    // Row 1: Hip-Pitch (S2) and Ankle-Pitch (S3) angles
+    snprintf(line, sizeof(line), "P:%5.1f A:%5.1f", ang[2], ang[3]);
     ssd1306_set_text(1, 0, line);
 
-    ssd1306_set_text(2, 0, "ESP32-Monitor");
-    ssd1306_set_text(3, 0, "192.168.4.1");
+    // Row 2: State of Charge
+    snprintf(line, sizeof(line), "SoC: %5.1f%%", soc_snap);
+    ssd1306_set_text(2, 0, line);
+
+    // Row 3: Device state
+    snprintf(line, sizeof(line), "State: %s", state_str);
+    ssd1306_set_text(3, 0, line);
 
     ssd1306_update_display();
     xSemaphoreGive(i2c_mutex);
-#endif
   }
+#else
+  vTaskDelete(NULL); // display disabled — self-terminate cleanly
+#endif
 }
